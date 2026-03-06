@@ -24,6 +24,13 @@ RUN uv sync --all-groups
 COPY environment/ /app/
 COPY mcp_servers/ /app/mcp_servers/
 
+# Build LD_PRELOAD sandbox library required by code execution server startup.
+RUN mkdir -p /app/lib \
+ && gcc -shared -fPIC -O2 \
+    -o /app/lib/sandbox_fs.so \
+    /app/mcp_servers/code/mcp_servers/code_execution_server/sandbox_fs.c \
+    -ldl -lpthread
+
 # Create subsystem directories
 RUN mkdir -p /filesystem /.apps_data
 

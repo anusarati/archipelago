@@ -4,7 +4,7 @@ Chart extraction utilities using LibreOffice PDF conversion.
 This module provides functions to extract chart images from Excel files by:
 1. Detecting if an Excel file contains charts
 2. Converting Excel to PDF via LibreOffice headless mode
-3. Extracting images from the PDF via Reducto
+3. Extracting images from the generated PDF pages locally
 
 These utilities are used by both LocalExtractor and SnapshotDiffGenerator
 for chart extraction in grading workflows.
@@ -22,7 +22,6 @@ import openpyxl
 from loguru import logger
 from pdf2image import convert_from_path
 
-from ..methods.reducto_extractor import ReductoExtractor
 from ..types import ImageMetadata
 
 
@@ -231,16 +230,17 @@ async def extract_chart_images_from_excel(
     metrics: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Extract chart images from Excel via LibreOffice PDF conversion + Reducto.
+    Extract chart images from Excel via LibreOffice PDF conversion + local PDF rasterization.
 
     Args:
         excel_path: Path to the Excel file
-        semaphore: Optional semaphore for rate limiting Reducto API calls
-        metrics: Optional dict to track reducto_calls_total/success/failed
+        semaphore: Unused, kept for backward compatibility with existing call sites
+        metrics: Optional dict to track extraction attempts
 
     Returns:
         List of image dicts with placeholder, type, and image data
     """
+    _ = semaphore
     try:
         if not has_charts_in_xlsx(excel_path):
             return []
@@ -259,43 +259,27 @@ async def extract_chart_images_from_excel(
                 return []
 
             if metrics is not None:
-                metrics["reducto_calls_total"] = (
-                    metrics.get("reducto_calls_total", 0) + 1
+                metrics["chart_extraction_total"] = (
+                    metrics.get("chart_extraction_total", 0) + 1
                 )
 
-            reducto_extractor = ReductoExtractor()
-
-            if semaphore is not None:
-                async with semaphore:
-                    extracted = await reducto_extractor.extract_from_file(
-                        pdf_path, include_images=True
-                    )
-            else:
-                extracted = await reducto_extractor.extract_from_file(
-                    pdf_path, include_images=True
-                )
+            extracted_images = pdf_to_base64_images(pdf_path)
 
             if metrics is not None:
-                metrics["reducto_calls_success"] = (
-                    metrics.get("reducto_calls_success", 0) + 1
+                metrics["chart_extraction_success"] = (
+                    metrics.get("chart_extraction_success", 0) + 1
                 )
 
-            if extracted and extracted.images:
-                chart_images = []
-                for i, img in enumerate(extracted.images):
-                    img_dict = img if isinstance(img, dict) else img.model_dump()
-                    img_dict["placeholder"] = f"[CHART_{i + 1}]"
-                    img_dict["type"] = "Chart"
-                    chart_images.append(img_dict)
-                return chart_images
+            if extracted_images:
+                return [img.model_dump() for img in extracted_images]
             return []
 
         except Exception as e:
             if metrics is not None:
-                metrics["reducto_calls_failed"] = (
-                    metrics.get("reducto_calls_failed", 0) + 1
+                metrics["chart_extraction_failed"] = (
+                    metrics.get("chart_extraction_failed", 0) + 1
                 )
-            logger.warning(f"[CHART] Reducto extraction failed: {e}")
+            logger.warning(f"[CHART] Chart image extraction failed: {e}")
             return []
 
         finally:

@@ -5,6 +5,9 @@ in the FastAPI application without restarting the server.
 """
 
 import asyncio
+import contextlib
+import inspect
+import os
 import time
 
 from asgi_lifespan import LifespanManager
@@ -52,8 +55,51 @@ class MCPReadinessError(Exception):
         """
         self.failed_servers = failed_servers
         server_list = ", ".join(failed_servers.keys())
-        self.message = message or f"MCP servers not ready after 5 min: {server_list}"
+        self.message = message or f"MCP servers not ready: {server_list}"
         super().__init__(self.message)
+
+
+def _parse_float_env(name: str, default: float) -> float:
+    """Parse float from environment variable with a safe fallback."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            f"Invalid value for {name}={raw!r}; using default {default:.1f}"
+        )
+        return default
+
+
+async def _resolve_mounted_servers_for_probe(mcp_proxy: FastMCP) -> list[object]:
+    """Resolve mounted servers used by FastMCP's aggregate list_tools path.
+
+    For FastMCP proxies created from MCP config dicts, mounted servers live
+    under MCPConfigTransport._composite_server rather than mcp_proxy itself.
+    """
+    direct_mounted = getattr(mcp_proxy, "_mounted_servers", None)
+    if isinstance(direct_mounted, list) and direct_mounted:
+        return direct_mounted
+
+    client_factory = getattr(mcp_proxy, "client_factory", None)
+    if client_factory is None:
+        return []
+
+    try:
+        maybe_client = client_factory()
+        if inspect.isawaitable(maybe_client):
+            maybe_client = await maybe_client
+        transport = getattr(maybe_client, "transport", None)
+        composite_server = getattr(transport, "_composite_server", None)
+        composite_mounted = getattr(composite_server, "_mounted_servers", None)
+        if isinstance(composite_mounted, list):
+            return composite_mounted
+    except Exception as e:
+        logger.debug(f"Failed to resolve composite mounted servers: {e}")
+
+    return []
 
 
 def _build_mcp_app_with_proxy(
@@ -89,27 +135,177 @@ def _build_mcp_app_with_proxy(
 async def warm_and_check_gateway(
     mcp_proxy: FastMCP,
     expected_servers: list[str],
-    max_wait_seconds: float = 300.0,
+    max_wait_seconds: float = 10.0,
     retry_interval: float = 1.0,
 ) -> int:
-    """Warm up gateway connections and verify all servers are ready.
+    """Warm up gateway and verify all expected servers provide tools.
 
-    Connects to the gateway and calls list_tools(). This forces the proxy to
-    connect to all backend servers (warming the connections). Then verifies
-    that every expected server contributed at least one tool.
+    Uses parallel per-mounted-server probes to avoid FastMCP's default
+    sequential mounted-server listing path during cold start. Falls back to
+    aggregate list_tools probing if mounted-server introspection is unavailable.
 
     Args:
         mcp_proxy: The FastMCP proxy instance to warm up
         expected_servers: List of server names that must provide tools
-        max_wait_seconds: Maximum time to wait for all servers (default 5 min)
+        max_wait_seconds: Maximum time to wait for all servers (default 10s)
         retry_interval: Time between retry attempts (default 1s)
 
     Returns:
-        Total number of tools loaded
+        Total number of tools loaded across ready servers
 
     Raises:
         MCPReadinessError: If any server doesn't provide tools within timeout
     """
+    if not expected_servers:
+        return 0
+
+    start_time = time.perf_counter()
+    deadline = start_time + max_wait_seconds
+    expected_set = set(expected_servers)
+
+    # Try parallel mounted-server probing first.
+    mounted_servers = await _resolve_mounted_servers_for_probe(mcp_proxy)
+    server_to_mounted: dict[str, object] = {}
+    for mounted in mounted_servers:
+        prefix = getattr(mounted, "prefix", None)
+        if isinstance(prefix, str) and prefix in expected_set:
+            server_to_mounted[prefix] = mounted
+            continue
+
+        mounted_server_obj = getattr(mounted, "server", None)
+        mounted_name = getattr(mounted_server_obj, "name", None)
+        if isinstance(mounted_name, str) and mounted_name in expected_set:
+            server_to_mounted[mounted_name] = mounted
+
+    # FastMCP internals can change. If we cannot map every expected server,
+    # fall back to aggregate list_tools probing.
+    if len(server_to_mounted) < len(expected_servers):
+        unresolved = sorted(expected_set - set(server_to_mounted.keys()))
+        logger.warning(
+            f"Mounted-server mapping incomplete ({len(server_to_mounted)}/{len(expected_servers)}). "
+            f"Falling back to aggregate readiness probing. unresolved={unresolved}"
+        )
+        return await _warm_and_check_gateway_via_aggregate_list_tools(
+            mcp_proxy=mcp_proxy,
+            expected_servers=expected_servers,
+            max_wait_seconds=max_wait_seconds,
+            retry_interval=retry_interval,
+        )
+
+    async def probe_server(server_name: str, mounted: object) -> tuple[bool, int, int, str]:
+        attempts = 0
+        last_error = ""
+        pending_task: asyncio.Task[list] | None = None
+
+        try:
+            while True:
+                attempts += 1
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    if not last_error:
+                        last_error = "Timeout"
+                    return False, 0, attempts, last_error
+
+                mounted_server_obj = getattr(mounted, "server", None)
+                list_tools_middleware = getattr(
+                    mounted_server_obj, "_list_tools_middleware", None
+                )
+                if list_tools_middleware is None:
+                    return False, 0, attempts, "Mounted server missing _list_tools_middleware"
+
+                if pending_task is None:
+                    pending_task = asyncio.create_task(list_tools_middleware())
+
+                poll_timeout = min(retry_interval, remaining)
+
+                try:
+                    tools = await asyncio.wait_for(
+                        asyncio.shield(pending_task), timeout=poll_timeout
+                    )
+                    pending_task = None
+                    tool_count = len(tools)
+                    if tool_count > 0:
+                        return True, tool_count, attempts, ""
+                    last_error = "No tools returned"
+                    logger.debug(
+                        f"Server '{server_name}' attempt {attempts}: no tools returned yet"
+                    )
+                except TimeoutError:
+                    last_error = "Timeout"
+                    elapsed = time.perf_counter() - start_time
+                    logger.debug(
+                        f"Server '{server_name}' attempt {attempts} ({elapsed:.1f}s): waiting for tool discovery"
+                    )
+                except Exception as e:
+                    last_error = str(e)
+                    pending_task = None
+                    elapsed = time.perf_counter() - start_time
+                    logger.debug(
+                        f"Server '{server_name}' attempt {attempts} ({elapsed:.1f}s): probe failed: {e}"
+                    )
+        finally:
+            if pending_task is not None and not pending_task.done():
+                pending_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pending_task
+
+    probe_tasks = {
+        server_name: asyncio.create_task(probe_server(server_name, mounted))
+        for server_name, mounted in server_to_mounted.items()
+    }
+
+    probe_results = await asyncio.gather(*probe_tasks.values())
+
+    elapsed = time.perf_counter() - start_time
+    servers_with_tools: dict[str, int] = {}
+    failed_servers: dict[str, ServerReadinessDetails] = {}
+
+    for server_name, (is_ready, tool_count, attempts, last_error) in zip(
+        probe_tasks.keys(), probe_results
+    ):
+        if is_ready:
+            servers_with_tools[server_name] = tool_count
+            logger.info(
+                f"Server '{server_name}' ready after {attempts} attempt(s) ({elapsed:.1f}s): {tool_count} tools"
+            )
+            continue
+
+        error_msg = f"No tools found after {elapsed:.1f}s"
+        if last_error:
+            error_msg += f" (last error: {last_error})"
+        failed_servers[server_name] = ServerReadinessDetails(
+            error=error_msg,
+            attempts=attempts,
+        )
+        logger.warning(
+            f"Server '{server_name}' FAILED after {attempts} attempt(s) ({elapsed:.1f}s): {error_msg}"
+        )
+
+    if not failed_servers:
+        total_tools = sum(servers_with_tools.values())
+        logger.info(
+            f"Gateway ready after {elapsed:.1f}s: {total_tools} tools from {len(expected_servers)} servers"
+        )
+        return total_tools
+
+    failed_count = len(failed_servers)
+    ready_count = len(servers_with_tools)
+    logger.error(
+        f"MCP readiness check failed: {failed_count} server(s) not ready ({ready_count} server(s) ready)"
+    )
+    failed_list = ", ".join(sorted(failed_servers.keys()))
+    raise MCPReadinessError(
+        failed_servers, message=f"MCP servers not ready after {elapsed:.1f}s: {failed_list}"
+    )
+
+
+async def _warm_and_check_gateway_via_aggregate_list_tools(
+    mcp_proxy: FastMCP,
+    expected_servers: list[str],
+    max_wait_seconds: float,
+    retry_interval: float,
+) -> int:
+    """Fallback readiness path using aggregate gateway list_tools()."""
     start_time = time.perf_counter()
     deadline = start_time + max_wait_seconds
     attempts = 0
@@ -120,82 +316,68 @@ async def warm_and_check_gateway(
     # FastMCP only prefixes tools when there are multiple servers
     single_server = len(expected_servers) == 1
 
-    while True:
-        attempts += 1
-        remaining = deadline - time.perf_counter()
+    pending_list_tools: asyncio.Task[list] | None = None
+    try:
+        async with FastMCPClient(mcp_proxy) as client:
+            while True:
+                attempts += 1
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    last_error = "Timeout"
+                    break
 
-        if remaining <= 0:
-            last_error = "Timeout"
-            break
+                if pending_list_tools is None:
+                    pending_list_tools = asyncio.create_task(client.list_tools())
 
-        try:
-            async with asyncio.timeout(remaining):
-                async with FastMCPClient(mcp_proxy) as client:
-                    tools = await client.list_tools()
+                poll_timeout = min(retry_interval, remaining)
+
+                try:
+                    tools = await asyncio.wait_for(
+                        asyncio.shield(pending_list_tools), timeout=poll_timeout
+                    )
+                    pending_list_tools = None
                     tool_names = [t.name for t in tools]
 
-                servers_with_tools = {}
-                if single_server:
-                    server = expected_servers[0]
-                    if tool_names:
-                        servers_with_tools[server] = len(tool_names)
-                else:
-                    # Sort by name length (longest first) to handle prefix collisions
-                    # e.g., "api_v2" before "api" so "api_v2_tool" isn't claimed by "api"
-                    sorted_servers = sorted(expected_servers, key=len, reverse=True)
-                    claimed_tools: set[str] = set()
+                    servers_with_tools = {}
+                    if single_server:
+                        server = expected_servers[0]
+                        if tool_names:
+                            servers_with_tools[server] = len(tool_names)
+                    else:
+                        sorted_servers = sorted(expected_servers, key=len, reverse=True)
+                        claimed_tools: set[str] = set()
+                        for server in sorted_servers:
+                            prefix = f"{server}_"
+                            matching = [
+                                name
+                                for name in tool_names
+                                if name.startswith(prefix) and name not in claimed_tools
+                            ]
+                            if matching:
+                                servers_with_tools[server] = len(matching)
+                                claimed_tools.update(matching)
 
-                    for server in sorted_servers:
-                        prefix = f"{server}_"
-                        matching = [
-                            name
-                            for name in tool_names
-                            if name.startswith(prefix) and name not in claimed_tools
-                        ]
-                        if matching:
-                            servers_with_tools[server] = len(matching)
-                            claimed_tools.update(matching)
-
-                missing_servers = set(expected_servers) - set(servers_with_tools.keys())
-
-                if not missing_servers:
-                    elapsed = time.perf_counter() - start_time
-                    total_tools = len(tools)
-                    logger.info(
-                        f"Gateway ready after {elapsed:.1f}s: {total_tools} tools from {len(expected_servers)} servers"
+                    missing_servers = set(expected_servers) - set(
+                        servers_with_tools.keys()
                     )
-                    for server, count in sorted(servers_with_tools.items()):
-                        logger.info(f"  - {server}: {count} tools")
-                    return total_tools
+                    if not missing_servers:
+                        elapsed = time.perf_counter() - start_time
+                        total_tools = len(tools)
+                        logger.info(
+                            f"Gateway ready after {elapsed:.1f}s via aggregate probe: {total_tools} tools from {len(expected_servers)} servers"
+                        )
+                        return total_tools
+                except TimeoutError:
+                    last_error = "Timeout"
+                except Exception as e:
+                    last_error = str(e)
+                    pending_list_tools = None
+    finally:
+        if pending_list_tools is not None and not pending_list_tools.done():
+            pending_list_tools.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending_list_tools
 
-                elapsed = time.perf_counter() - start_time
-                ready_list = ", ".join(
-                    f"{s} ({c} tools)" for s, c in servers_with_tools.items()
-                )
-                missing_list = ", ".join(missing_servers)
-                if ready_list:
-                    logger.debug(
-                        f"Attempt {attempts} ({elapsed:.1f}s): Ready: [{ready_list}], Waiting: [{missing_list}]"
-                    )
-                else:
-                    logger.debug(
-                        f"Attempt {attempts} ({elapsed:.1f}s): Waiting for all servers"
-                    )
-
-        except TimeoutError:
-            last_error = "Timeout"
-            break
-
-        except Exception as e:
-            elapsed = time.perf_counter() - start_time
-            last_error = str(e)
-            logger.debug(
-                f"Attempt {attempts} ({elapsed:.1f}s): Gateway connection failed: {e}"
-            )
-
-        await asyncio.sleep(retry_interval)
-
-    # Failure path - report results
     elapsed = time.perf_counter() - start_time
     failed_servers: dict[str, ServerReadinessDetails] = {}
 
@@ -207,21 +389,11 @@ async def warm_and_check_gateway(
             error=error_msg,
             attempts=attempts,
         )
-        logger.warning(
-            f"Server '{server}' FAILED after {attempts} attempt(s) ({elapsed:.1f}s): {error_msg}"
-        )
 
-    for server, count in servers_with_tools.items():
-        logger.info(
-            f"Server '{server}' ready after {attempts} attempt(s) ({elapsed:.1f}s): {count} tools"
-        )
-
-    failed_count = len(failed_servers)
-    ready_count = len(servers_with_tools)
-    logger.error(
-        f"MCP readiness check failed: {failed_count} server(s) not ready ({ready_count} server(s) ready)"
+    failed_list = ", ".join(sorted(failed_servers.keys()))
+    raise MCPReadinessError(
+        failed_servers, message=f"MCP servers not ready after {elapsed:.1f}s: {failed_list}"
     )
-    raise MCPReadinessError(failed_servers)
 
 
 async def swap_mcp_app(config: MCPSchema, app: FastAPI) -> None:
@@ -291,7 +463,16 @@ async def swap_mcp_app(config: MCPSchema, app: FastAPI) -> None:
             await asyncio.sleep(1.0)
 
             server_names = list(config.mcpServers.keys())
-            _ = await warm_and_check_gateway(mcp_proxy, server_names)
+            readiness_timeout = _parse_float_env("MCP_READINESS_TIMEOUT_SECONDS", 10.0)
+            readiness_poll_interval = _parse_float_env(
+                "MCP_READINESS_RETRY_INTERVAL_SECONDS", 1.0
+            )
+            _ = await warm_and_check_gateway(
+                mcp_proxy,
+                server_names,
+                max_wait_seconds=readiness_timeout,
+                retry_interval=readiness_poll_interval,
+            )
 
         except MCPReadinessError:
             raise

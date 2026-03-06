@@ -6,6 +6,7 @@ Usage:
     ./run.sh              # Run task index 0
     ./run.sh 42           # Run task index 42
     ./run.sh task_abc123  # Run task by ID
+    ./run.sh world_abc123 # Run all tasks in a world
 """
 
 import io
@@ -33,6 +34,19 @@ GRADING_DIR = Path(os.environ.get("GRADING_DIR", ARCHIPELAGO_DIR / "grading"))
 
 ENV_URL = os.environ.get("ENV_URL", "http://localhost:8080")
 HF_DATASET = "mercor/apex-agents"
+INFRA_FAILURE_EXIT_CODE = 42
+DEFAULT_MCP_CONFIG_FILE = "mcp_config_all_oss_servers.json"
+WORLD_APP_TO_SERVER = {
+    "calendar": "calendar_server",
+    "chat": "chat_server",
+    "code execution": "code_execution_server",
+    "excel": "sheets_server",
+    "filesystem": "filesystem_server",
+    "mail": "mail_server",
+    "pdfs": "pdf_server",
+    "powerpoint": "slides_server",
+    "word": "docs_server",
+}
 
 # Default task: Investment Banking World 221 - BBDC/TVPG accretion/dilution sensitivity analysis
 DEFAULT_TASK = "task_9ba58a6197114140877a1df1754d2993"
@@ -40,6 +54,18 @@ DEFAULT_TASK = "task_9ba58a6197114140877a1df1754d2993"
 
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def log_progress(scope: str, current: int, total: int, msg: str):
+    pct = (current / total) * 100 if total > 0 else 0
+    log(f"[{scope}] {current}/{total} ({pct:.0f}%) - {msg}")
+
+
+def env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def wait_for_health(url: str, timeout: int = 120) -> bool:
@@ -77,16 +103,23 @@ def start_environment():
         ["docker", "compose", "up", "-d", "--build"], cwd=ENVIRONMENT_DIR
     )
     if result.returncode != 0:
-        log("ERROR: Failed to start environment")
-        sys.exit(1)
+        raise RuntimeError("Failed to start environment")
 
     log("Waiting for environment to be healthy...")
     if not wait_for_health(ENV_URL):
         subprocess.run(["docker", "compose", "logs"], cwd=ENVIRONMENT_DIR)
-        log("ERROR: Environment failed to start")
-        sys.exit(1)
+        raise RuntimeError("Environment failed to start")
 
     log("Environment started")
+
+
+def ensure_environment_ready():
+    """Reuse a healthy environment, or start one if unavailable."""
+    if wait_for_health(ENV_URL, timeout=5):
+        log("Environment already healthy; reusing existing container")
+        return
+    log("Environment not healthy; starting container")
+    start_environment()
 
 
 def tar_gz_to_zip(tar_gz_path: Path) -> Path:
@@ -109,19 +142,160 @@ def main():
     # Parse task selector from command line (index, task ID, or use default)
     task_selector = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TASK
 
-    # Load task and world data from HuggingFace
-    log("Downloading task data from HuggingFace...")
-    tasks_path = hf_hub_download(
-        HF_DATASET, "tasks_and_rubrics.json", repo_type="dataset"
-    )
-    worlds_path = hf_hub_download(
-        HF_DATASET, "world_descriptions.json", repo_type="dataset"
-    )
+    # Load task/world metadata (allow parent process to pass cached paths)
+    tasks_path_env = os.environ.get("HF_TASKS_JSON_PATH")
+    worlds_path_env = os.environ.get("HF_WORLDS_JSON_PATH")
+
+    if tasks_path_env and worlds_path_env:
+        tasks_path = tasks_path_env
+        worlds_path = worlds_path_env
+        log("Using cached task/world metadata from environment")
+    else:
+        log("Downloading task/world metadata from HuggingFace...")
+        tasks_path = hf_hub_download(
+            HF_DATASET, "tasks_and_rubrics.json", repo_type="dataset"
+        )
+        worlds_path = hf_hub_download(
+            HF_DATASET, "world_descriptions.json", repo_type="dataset"
+        )
 
     with open(tasks_path) as f:
         tasks = json.load(f)
     with open(worlds_path) as f:
         worlds = {w["world_id"]: w for w in json.load(f)}
+
+    # World mode: run all tasks for a specific world sequentially
+    if task_selector.startswith("world_"):
+        world_id = task_selector
+        world_tasks = [t for t in tasks if t.get("world_id") == world_id]
+        if not world_tasks:
+            log(f"ERROR: No tasks found for world: {world_id}")
+            sys.exit(1)
+
+        world_name = worlds.get(world_id, {}).get("world_name", "Unknown world")
+        log("=" * 60)
+        log(f"WORLD RUN: {world_name} ({world_id})")
+        log(f"Tasks to run: {len(world_tasks)}")
+        log("=" * 60)
+
+        # Download this world's snapshot exactly once and reuse for all tasks.
+        log("Preparing world snapshot cache...")
+        world_zip_cached = hf_hub_download(
+            HF_DATASET, f"world_files_zipped/{world_id}.zip", repo_type="dataset"
+        )
+        log(f"Using cached world snapshot: {world_zip_cached}")
+
+        summary_dir = EXAMPLE_DIR / "output" / world_id
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        summary: list[dict[str, object]] = []
+        script_path = Path(__file__).resolve()
+        stop_reason: str | None = None
+        continue_on_infra_failure = (
+            os.environ.get("WORLD_CONTINUE_ON_INFRA_FAILURE", "false").lower()
+            in ("1", "true", "yes")
+        )
+        reuse_world_environment = env_truthy("WORLD_REUSE_ENVIRONMENT", default=True)
+
+        if reuse_world_environment:
+            log("Ensuring shared environment for world run...")
+            ensure_environment_ready()
+
+        for i, world_task in enumerate(world_tasks, start=1):
+            task_id = world_task["task_id"]
+            task_name = world_task.get("task_name", task_id)
+            log("-" * 60)
+            log_progress(
+                scope="WORLD",
+                current=i,
+                total=len(world_tasks),
+                msg=f"Running {task_id} ({task_name})",
+            )
+
+            child_env = os.environ.copy()
+            child_env["HF_TASKS_JSON_PATH"] = str(tasks_path)
+            child_env["HF_WORLDS_JSON_PATH"] = str(worlds_path)
+            child_env["HF_WORLD_ZIP_PATH"] = str(world_zip_cached)
+            if reuse_world_environment:
+                child_env["HF_SKIP_START_ENVIRONMENT"] = "1"
+
+            result = subprocess.run(
+                [sys.executable, str(script_path), task_id], env=child_env
+            )
+
+            task_output_dir = EXAMPLE_DIR / "output" / task_id
+            trajectory_status = None
+            final_score = None
+
+            trajectory_file = task_output_dir / "trajectory.json"
+            if trajectory_file.exists():
+                with open(trajectory_file) as f:
+                    trajectory = json.load(f)
+                trajectory_status = trajectory.get("status")
+
+            grades_file = task_output_dir / "grades.json"
+            if grades_file.exists():
+                with open(grades_file) as f:
+                    grades = json.load(f)
+                final_score = grades.get("scoring_results", {}).get("final_score")
+
+            summary.append(
+                {
+                    "task_id": task_id,
+                    "task_name": task_name,
+                    "world_id": world_id,
+                    "return_code": result.returncode,
+                    "agent_status": trajectory_status,
+                    "final_score": final_score,
+                }
+            )
+
+            if result.returncode == INFRA_FAILURE_EXIT_CODE:
+                stop_reason = (
+                    f"Infrastructure failure while configuring MCP servers on task {task_id}"
+                )
+                log(f"ERROR: {stop_reason}")
+                if continue_on_infra_failure:
+                    log(
+                        "WORLD_CONTINUE_ON_INFRA_FAILURE=true, continuing despite infra failure"
+                    )
+                else:
+                    log("Stopping world run early due to infra failure")
+                    break
+
+        summary_file = summary_dir / "summary.json"
+        with open(summary_file, "w") as f:
+            json.dump(
+                {
+                    "world_id": world_id,
+                    "world_name": world_name,
+                    "task_count": len(world_tasks),
+                    "tasks_executed": len(summary),
+                    "stopped_early": stop_reason is not None,
+                    "stop_reason": stop_reason,
+                    "summary": summary,
+                },
+                f,
+                indent=2,
+            )
+
+        success_count = sum(1 for s in summary if s["return_code"] == 0)
+        failure_count = len(summary) - success_count
+
+        log("=" * 60)
+        log("WORLD RUN SUMMARY")
+        log("=" * 60)
+        log(f"World: {world_name} ({world_id})")
+        log(f"Total tasks: {len(world_tasks)}")
+        log(f"Tasks executed: {len(summary)}")
+        log(f"Succeeded: {success_count}")
+        log(f"Failed: {failure_count}")
+        if stop_reason:
+            log(f"Stopped early: {stop_reason}")
+        log(f"Summary file: {summary_file}")
+
+        if failure_count > 0 or stop_reason:
+            sys.exit(1)
+        return
 
     # Find the task
     if task_selector.isdigit():
@@ -153,17 +327,44 @@ def main():
     log(f"World: {world['world_name']}")
     log(f"Prompt: {task['prompt'][:100]}...")
     log("=" * 60)
+    step = 0
+    total_steps = 7
 
-    start_environment()
+    step += 1
+    skip_start_environment = env_truthy("HF_SKIP_START_ENVIRONMENT", default=False)
+    if skip_start_environment:
+        log_progress(task["task_id"], step, total_steps, "Reusing environment")
+        ensure_environment_ready()
+    else:
+        log_progress(task["task_id"], step, total_steps, "Starting environment")
+        start_environment()
 
     # Download and extract world snapshot
-    log(f"Downloading world snapshot: {world_id}")
-    zip_path = hf_hub_download(
-        HF_DATASET, f"world_files_zipped/{world_id}.zip", repo_type="dataset"
-    )
+    step += 1
+    log_progress(task["task_id"], step, total_steps, "Preparing world snapshot")
+    cached_world_zip = os.environ.get("HF_WORLD_ZIP_PATH")
+    if cached_world_zip and Path(cached_world_zip).exists():
+        cached_path = Path(cached_world_zip)
+        if cached_path.name == f"{world_id}.zip":
+            zip_path = str(cached_path)
+            log(f"Using cached world snapshot from parent: {zip_path}")
+        else:
+            log(
+                f"Cached world snapshot {cached_path.name} does not match {world_id}.zip, downloading correct world snapshot..."
+            )
+            zip_path = hf_hub_download(
+                HF_DATASET, f"world_files_zipped/{world_id}.zip", repo_type="dataset"
+            )
+    else:
+        log(f"Downloading world snapshot: {world_id}")
+        zip_path = hf_hub_download(
+            HF_DATASET, f"world_files_zipped/{world_id}.zip", repo_type="dataset"
+        )
     world_zip = output_dir / f"{world_id}.zip"
     shutil.copy(zip_path, world_zip)
 
+    step += 1
+    log_progress(task["task_id"], step, total_steps, "Populating environment")
     log("Populating environment with world snapshot...")
     with zipfile.ZipFile(world_zip, "r") as zf:
         names = zf.namelist()
@@ -206,14 +407,110 @@ def main():
                     sys.exit(1)
                 log(f"  {subsystem}: {resp.json()}")
 
-    # Configure MCP servers using the all-servers config
+    # Configure MCP servers
+    step += 1
+    log_progress(task["task_id"], step, total_steps, "Configuring MCP servers")
     log("Configuring MCP servers...")
-    with open(EXAMPLE_DIR / "mcp_config_all_oss_servers.json") as f:
-        mcp_config = json.load(f)
+    mcp_config_override = os.environ.get("MCP_CONFIG_FILE")
+    mcp_config: dict[str, object]
+    if mcp_config_override:
+        mcp_config_path = Path(mcp_config_override)
+        if not mcp_config_path.is_absolute():
+            mcp_config_path = EXAMPLE_DIR / mcp_config_override
+        if not mcp_config_path.exists():
+            log(f"ERROR: MCP config file not found: {mcp_config_path}")
+            sys.exit(1)
+        log(f"  MCP config: {mcp_config_path.name} (override)")
+        with open(mcp_config_path) as f:
+            mcp_config = json.load(f)
+    else:
+        base_config_path = EXAMPLE_DIR / DEFAULT_MCP_CONFIG_FILE
+        with open(base_config_path) as f:
+            full_config = json.load(f)
+
+        configured_servers = full_config.get("mcpServers", {})
+        world_id = task.get("world_id")
+        world_info = worlds.get(world_id, {})
+        world_apps = world_info.get("apps", [])
+        selected_servers: list[str] = []
+        unknown_services: list[str] = []
+
+        if isinstance(world_apps, list) and world_apps:
+            for app in world_apps:
+                if not isinstance(app, dict):
+                    continue
+                service_name = str(app.get("service_name", "")).strip()
+                if not service_name:
+                    continue
+                server_name = WORLD_APP_TO_SERVER.get(service_name.lower())
+                if server_name is None:
+                    unknown_services.append(service_name)
+                    continue
+                if server_name in configured_servers and server_name not in selected_servers:
+                    selected_servers.append(server_name)
+
+        if selected_servers:
+            mcp_config = {
+                "mcpServers": {
+                    server_name: configured_servers[server_name]
+                    for server_name in selected_servers
+                }
+            }
+            log(f"  MCP config: {DEFAULT_MCP_CONFIG_FILE} (filtered by world apps)")
+        else:
+            mcp_config = full_config
+            log(f"  MCP config: {DEFAULT_MCP_CONFIG_FILE} (no app filter)")
+
+        if unknown_services:
+            log(f"  Unknown world services (ignored): {unknown_services}")
+
     log(f"  Servers: {list(mcp_config['mcpServers'].keys())}")
 
-    resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=600.0)
-    resp.raise_for_status()
+    max_apps_attempts = int(os.environ.get("MCP_CONFIGURE_MAX_ATTEMPTS", "3"))
+    apps_retry_delay = float(os.environ.get("MCP_CONFIGURE_RETRY_DELAY_SECONDS", "2"))
+    for apps_attempt in range(1, max_apps_attempts + 1):
+        log(f"  /apps attempt {apps_attempt}/{max_apps_attempts}...")
+        try:
+            resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=600.0)
+            resp.raise_for_status()
+            break
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            if status == 503:
+                log("ERROR: MCP gateway readiness failed (503 Service Unavailable)")
+                try:
+                    payload = e.response.json()
+                    detail = payload.get("detail", {}) if isinstance(payload, dict) else {}
+                    failed_servers = detail.get("failed_servers", [])
+                    server_details = detail.get("details", {})
+                    if failed_servers:
+                        log(f"Failed servers: {', '.join(failed_servers)}")
+                        for server in failed_servers:
+                            d = server_details.get(server, {})
+                            err = d.get("error", "unknown error")
+                            attempts = d.get("attempts", "unknown")
+                            log(f"  - {server}: {err} (attempts={attempts})")
+                    else:
+                        log(f"Response body: {e.response.text}")
+                except Exception:
+                    log(
+                        f"Response body: {e.response.text if e.response is not None else ''}"
+                    )
+
+                if apps_attempt < max_apps_attempts:
+                    log(
+                        f"Retrying MCP configuration in {apps_retry_delay:.1f}s (readiness timeout can be transient on cold start)..."
+                    )
+                    time.sleep(apps_retry_delay)
+                    continue
+
+                sys.exit(INFRA_FAILURE_EXIT_CODE)
+
+            log(f"ERROR: Failed configuring MCP servers (status={status}): {e}")
+            sys.exit(INFRA_FAILURE_EXIT_CODE)
+        except Exception as e:
+            log(f"ERROR: Unexpected MCP configuration failure: {e}")
+            sys.exit(INFRA_FAILURE_EXIT_CODE)
     log("MCP servers configured")
 
     # Generate initial messages from HuggingFace task prompt
@@ -264,6 +561,8 @@ Don't over-explain. Be concise but show your thinking.
     trajectory_file = output_dir / "trajectory.json"
 
     # Run agent
+    step += 1
+    log_progress(task["task_id"], step, total_steps, "Running agent")
     log("Running agent...")
     agent_cmd = [
         "uv",
@@ -304,6 +603,8 @@ Don't over-explain. Be concise but show your thinking.
             log(f"Agent status: {agent_status}")
 
     # Save final snapshot
+    step += 1
+    log_progress(task["task_id"], step, total_steps, "Saving final snapshot")
     log("Saving final snapshot...")
     with httpx.stream("POST", f"{ENV_URL}/data/snapshot") as resp:
         resp.raise_for_status()
@@ -316,6 +617,8 @@ Don't over-explain. Be concise but show your thinking.
     log(f"Saved: {final_zip}")
 
     # Run grading if agent completed
+    step += 1
+    log_progress(task["task_id"], step, total_steps, "Running grading (if applicable)")
     if agent_status != "completed":
         log(f"Skipping grading (agent status: {agent_status})")
     else:
@@ -393,4 +696,8 @@ Don't over-explain. Be concise but show your thinking.
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log(f"ERROR: {e}")
+        sys.exit(1)

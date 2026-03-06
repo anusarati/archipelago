@@ -48,6 +48,9 @@ The script will:
 
 # Run task by ID
 ./run.sh task_9ba58a6197114140877a1df1754d2993
+
+# Run all tasks for one world
+./run.sh world_eec3883ca3c54c41a62d3f220a27736c
 ```
 
 ## Output
@@ -96,7 +99,38 @@ Edit `orchestrator_config.json`:
 
 ### Using Fewer MCP Servers
 
-The default `mcp_config_all_oss_servers.json` starts all 9 servers. For faster startup, you can create a custom config with only the servers your task needs. Check the world description in the HuggingFace dataset to see which apps are required.
+By default, this runner loads `mcp_config_all_oss_servers.json` and then filters to the exact servers required by the world's `apps` field from HuggingFace metadata.
+
+You can always override the config file:
+
+```bash
+MCP_CONFIG_FILE=mcp_config_all_oss_servers.json ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
+```
+
+If MCP readiness is flaky on cold start, the runner retries `/apps` up to 3 times by default. You can tune:
+
+```bash
+MCP_CONFIGURE_MAX_ATTEMPTS=5 MCP_CONFIGURE_RETRY_DELAY_SECONDS=2 ./run.sh ...
+```
+
+Gateway-side readiness timeout defaults to 10 seconds. You can tune it in `environment/.env`:
+
+```bash
+MCP_READINESS_TIMEOUT_SECONDS=10
+MCP_READINESS_RETRY_INTERVAL_SECONDS=1
+```
+
+### World Run Environment Reuse
+
+World runs now reuse one environment container by default (`WORLD_REUSE_ENVIRONMENT=true`) and skip container restarts for each child task.
+
+```bash
+# default behavior (reuse one container for the whole world run)
+./run.sh world_eec3883ca3c54c41a62d3f220a27736c
+
+# force old behavior (restart container for each task)
+WORLD_REUSE_ENVIRONMENT=false ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
+```
 
 ## Available MCP Servers
 

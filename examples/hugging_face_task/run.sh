@@ -7,6 +7,7 @@
 #   ./run.sh                    # Run default task (Investment Banking)
 #   ./run.sh 42                 # Run task at index 42
 #   ./run.sh task_abc123        # Run task by ID
+#   ./run.sh world_abc123       # Run all tasks in one world
 #
 # Prerequisites:
 #   - Docker running

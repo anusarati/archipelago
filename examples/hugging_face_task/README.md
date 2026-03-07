@@ -136,7 +136,7 @@ WORLD_REUSE_ENVIRONMENT=false ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
 
 World mode resumes by default (`WORLD_RESUME=true`) using `output/<world_id>/summary.json`:
 
-- Completed tasks (`return_code == 0`) are skipped
+- Completed tasks (`return_code == 0` and `agent_status == "completed"`) are skipped
 - Failed/incomplete tasks are re-run
 
 ```bash

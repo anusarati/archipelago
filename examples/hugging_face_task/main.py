@@ -215,6 +215,13 @@ def _write_world_summary(
     return summary
 
 
+def _is_resume_completed_task(entry: dict[str, object] | None) -> bool:
+    """Only skip tasks that fully completed agent execution in prior runs."""
+    if not entry:
+        return False
+    return entry.get("return_code") == 0 and entry.get("agent_status") == "completed"
+
+
 def main():
     # Parse task selector from command line (index, task ID, or use default)
     task_selector = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TASK
@@ -282,7 +289,7 @@ def main():
             completed_task_ids = {
                 task_id
                 for task_id, entry in summary_by_task.items()
-                if entry.get("return_code") == 0
+                if _is_resume_completed_task(entry)
             }
             if completed_task_ids:
                 log(
@@ -313,13 +320,15 @@ def main():
                 )
 
                 existing_entry = summary_by_task.get(task_id)
-                if (
-                    world_resume
-                    and existing_entry
-                    and existing_entry.get("return_code") == 0
-                ):
+                if world_resume and _is_resume_completed_task(existing_entry):
                     log(f"Skipping completed task from previous run: {task_id}")
                     continue
+                if world_resume and existing_entry:
+                    log(
+                        "Retrying task from previous run due to incomplete status: "
+                        f"{task_id} (return_code={existing_entry.get('return_code')}, "
+                        f"agent_status={existing_entry.get('agent_status')})"
+                    )
 
                 child_env = os.environ.copy()
                 child_env["HF_TASKS_JSON_PATH"] = str(tasks_path)

@@ -15,6 +15,7 @@ from litellm.exceptions import (
     Timeout,
 )
 from litellm.files.main import ModelResponse
+from loguru import logger
 from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 
 from runner.agents.models import LitellmAnyMessage
@@ -26,6 +27,32 @@ settings = get_settings()
 # Configure LiteLLM proxy routing if configured
 if settings.LITELLM_PROXY_API_BASE and settings.LITELLM_PROXY_API_KEY:
     litellm.use_litellm_proxy = True
+
+
+def _serialize_any_message(msg: LitellmAnyMessage) -> Any:
+    """Convert a LiteLLM message object to JSON-friendly data for logging."""
+    if isinstance(msg, dict):
+        return msg
+
+    model_dump = getattr(msg, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode="json")
+        except TypeError:
+            return model_dump()
+
+    return str(msg)
+
+
+def _serialize_model_response(response: ModelResponse) -> Any:
+    """Convert ModelResponse to JSON-friendly data for logging."""
+    model_dump = getattr(response, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode="json")
+        except TypeError:
+            return model_dump()
+    return str(response)
 
 
 def _is_context_window_error(e: Exception) -> bool:
@@ -139,6 +166,19 @@ async def generate_response(
         **extra_args,
     }
 
+    logger.bind(
+        message_type="llm_request",
+        model=model,
+        payload={
+            "messages": [_serialize_any_message(m) for m in messages],
+            "tools": tools,
+            "stream": stream,
+            "timeout": llm_response_timeout,
+            "extra_args": extra_args,
+            "trajectory_id": trajectory_id,
+        },
+    ).info("LLM request")
+
     # If LiteLLM proxy is configured, add tracking tags
     if settings.LITELLM_PROXY_API_BASE and settings.LITELLM_PROXY_API_KEY:
         tags = ["service:trajectory"]
@@ -156,10 +196,22 @@ async def generate_response(
         rebuilt = litellm.stream_chunk_builder(chunks, messages=messages)
         if rebuilt is None:
             raise RuntimeError("stream_chunk_builder returned None — empty stream")
-        return ModelResponse.model_validate(rebuilt)
+        response = ModelResponse.model_validate(rebuilt)
+        logger.bind(
+            message_type="llm_response",
+            model=model,
+            payload=_serialize_model_response(response),
+        ).info("LLM response")
+        return response
 
     response = await acompletion(**kwargs)
-    return ModelResponse.model_validate(response)
+    validated = ModelResponse.model_validate(response)
+    logger.bind(
+        message_type="llm_response",
+        model=model,
+        payload=_serialize_model_response(validated),
+    ).info("LLM response")
+    return validated
 
 
 @with_retry(
@@ -211,6 +263,20 @@ async def call_responses_api(
         **extra_args,
     }
 
+    logger.bind(
+        message_type="llm_request",
+        model=model,
+        payload={
+            "messages": [_serialize_any_message(m) for m in messages],
+            "tools": tools,
+            "stream": stream,
+            "timeout": llm_response_timeout,
+            "extra_args": extra_args,
+            "trajectory_id": trajectory_id,
+            "api": "responses",
+        },
+    ).info("LLM request")
+
     if settings.LITELLM_PROXY_API_BASE and settings.LITELLM_PROXY_API_KEY:
         kwargs["api_base"] = settings.LITELLM_PROXY_API_BASE
         kwargs["api_key"] = settings.LITELLM_PROXY_API_KEY
@@ -230,7 +296,19 @@ async def call_responses_api(
             raise RuntimeError(
                 "No response.completed event received from Responses API stream"
             )
+        logger.bind(
+            message_type="llm_response",
+            model=model,
+            payload=completed_response.model_dump()
+            if hasattr(completed_response, "model_dump")
+            else str(completed_response),
+        ).info("LLM response")
         return completed_response
 
     response = await aresponses(**kwargs)
+    logger.bind(
+        message_type="llm_response",
+        model=model,
+        payload=response.model_dump() if hasattr(response, "model_dump") else str(response),
+    ).info("LLM response")
     return response

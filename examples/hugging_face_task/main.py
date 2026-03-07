@@ -177,6 +177,44 @@ def _parse_existing_world_summary(
     return summary_by_task, old_stop_reason
 
 
+def _build_world_summary(
+    world_tasks: list[dict[str, object]], summary_by_task: dict[str, dict[str, object]]
+) -> list[dict[str, object]]:
+    """Build ordered world summary list matching world task order."""
+    return [
+        summary_by_task[t["task_id"]]
+        for t in world_tasks
+        if t["task_id"] in summary_by_task
+    ]
+
+
+def _write_world_summary(
+    summary_file: Path,
+    world_id: str,
+    world_name: str,
+    world_tasks: list[dict[str, object]],
+    summary_by_task: dict[str, dict[str, object]],
+    stop_reason: str | None,
+) -> list[dict[str, object]]:
+    """Persist world summary file and return ordered summary records."""
+    summary = _build_world_summary(world_tasks, summary_by_task)
+    with open(summary_file, "w") as f:
+        json.dump(
+            {
+                "world_id": world_id,
+                "world_name": world_name,
+                "task_count": len(world_tasks),
+                "tasks_executed": len(summary),
+                "stopped_early": stop_reason is not None,
+                "stop_reason": stop_reason,
+                "summary": summary,
+            },
+            f,
+            indent=2,
+        )
+    return summary
+
+
 def main():
     # Parse task selector from command line (index, task ID, or use default)
     task_selector = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TASK
@@ -257,90 +295,121 @@ def main():
             log("Ensuring shared environment for world run...")
             ensure_environment_ready()
 
-        for i, world_task in enumerate(world_tasks, start=1):
-            task_id = world_task["task_id"]
-            task_name = world_task.get("task_name", task_id)
-            log("-" * 60)
-            log_progress(
-                scope="WORLD",
-                current=i,
-                total=len(world_tasks),
-                msg=f"Running {task_id} ({task_name})",
-            )
+        current_task_id: str | None = None
+        task_name_by_id = {
+            str(t["task_id"]): str(t.get("task_name", t["task_id"])) for t in world_tasks
+        }
 
-            existing_entry = summary_by_task.get(task_id)
-            if world_resume and existing_entry and existing_entry.get("return_code") == 0:
-                log(f"Skipping completed task from previous run: {task_id}")
-                continue
-
-            child_env = os.environ.copy()
-            child_env["HF_TASKS_JSON_PATH"] = str(tasks_path)
-            child_env["HF_WORLDS_JSON_PATH"] = str(worlds_path)
-            child_env["HF_WORLD_ZIP_PATH"] = str(world_zip_cached)
-            if reuse_world_environment:
-                child_env["HF_SKIP_START_ENVIRONMENT"] = "1"
-
-            result = subprocess.run(
-                [sys.executable, str(script_path), task_id], env=child_env
-            )
-
-            task_output_dir = EXAMPLE_DIR / "output" / task_id
-            trajectory_status = None
-            final_score = None
-
-            trajectory_file = task_output_dir / "trajectory.json"
-            if trajectory_file.exists():
-                with open(trajectory_file) as f:
-                    trajectory = json.load(f)
-                trajectory_status = trajectory.get("status")
-
-            grades_file = task_output_dir / "grades.json"
-            if grades_file.exists():
-                with open(grades_file) as f:
-                    grades = json.load(f)
-                final_score = grades.get("scoring_results", {}).get("final_score")
-
-            summary_by_task[task_id] = {
-                "task_id": task_id,
-                "task_name": task_name,
-                "world_id": world_id,
-                "return_code": result.returncode,
-                "agent_status": trajectory_status,
-                "final_score": final_score,
-            }
-
-            if result.returncode == INFRA_FAILURE_EXIT_CODE:
-                stop_reason = (
-                    f"Infrastructure failure while configuring MCP servers on task {task_id}"
+        try:
+            for i, world_task in enumerate(world_tasks, start=1):
+                task_id = world_task["task_id"]
+                task_name = world_task.get("task_name", task_id)
+                log("-" * 60)
+                log_progress(
+                    scope="WORLD",
+                    current=i,
+                    total=len(world_tasks),
+                    msg=f"Running {task_id} ({task_name})",
                 )
-                log(f"ERROR: {stop_reason}")
-                if continue_on_infra_failure:
-                    log(
-                        "WORLD_CONTINUE_ON_INFRA_FAILURE=true, continuing despite infra failure"
-                    )
-                else:
-                    log("Stopping world run early due to infra failure")
-                    break
 
-        summary = [
-            summary_by_task[t["task_id"]]
-            for t in world_tasks
-            if t["task_id"] in summary_by_task
-        ]
-        with open(summary_file, "w") as f:
-            json.dump(
-                {
+                existing_entry = summary_by_task.get(task_id)
+                if (
+                    world_resume
+                    and existing_entry
+                    and existing_entry.get("return_code") == 0
+                ):
+                    log(f"Skipping completed task from previous run: {task_id}")
+                    continue
+
+                child_env = os.environ.copy()
+                child_env["HF_TASKS_JSON_PATH"] = str(tasks_path)
+                child_env["HF_WORLDS_JSON_PATH"] = str(worlds_path)
+                child_env["HF_WORLD_ZIP_PATH"] = str(world_zip_cached)
+                if reuse_world_environment:
+                    child_env["HF_SKIP_START_ENVIRONMENT"] = "1"
+
+                current_task_id = task_id
+                result = subprocess.run(
+                    [sys.executable, str(script_path), task_id], env=child_env
+                )
+                current_task_id = None
+
+                task_output_dir = EXAMPLE_DIR / "output" / task_id
+                trajectory_status = None
+                final_score = None
+
+                trajectory_file = task_output_dir / "trajectory.json"
+                if trajectory_file.exists():
+                    with open(trajectory_file) as f:
+                        trajectory = json.load(f)
+                    trajectory_status = trajectory.get("status")
+
+                grades_file = task_output_dir / "grades.json"
+                if grades_file.exists():
+                    with open(grades_file) as f:
+                        grades = json.load(f)
+                    final_score = grades.get("scoring_results", {}).get("final_score")
+
+                summary_by_task[task_id] = {
+                    "task_id": task_id,
+                    "task_name": task_name,
                     "world_id": world_id,
-                    "world_name": world_name,
-                    "task_count": len(world_tasks),
-                    "tasks_executed": len(summary),
-                    "stopped_early": stop_reason is not None,
-                    "stop_reason": stop_reason,
-                    "summary": summary,
-                },
-                f,
-                indent=2,
-            )
+                    "return_code": result.returncode,
+                    "agent_status": trajectory_status,
+                    "final_score": final_score,
+                }
+
+                # Persist progress after each task so resume works after interruption.
+                _ = _write_world_summary(
+                    summary_file=summary_file,
+                    world_id=world_id,
+                    world_name=world_name,
+                    world_tasks=world_tasks,
+                    summary_by_task=summary_by_task,
+                    stop_reason=stop_reason,
+                )
+
+                if result.returncode == INFRA_FAILURE_EXIT_CODE:
+                    stop_reason = (
+                        f"Infrastructure failure while configuring MCP servers on task {task_id}"
+                    )
+                    log(f"ERROR: {stop_reason}")
+                    if continue_on_infra_failure:
+                        log(
+                            "WORLD_CONTINUE_ON_INFRA_FAILURE=true, continuing despite infra failure"
+                        )
+                    else:
+                        log("Stopping world run early due to infra failure")
+                        break
+        except KeyboardInterrupt:
+            interrupted_task = current_task_id
+            if interrupted_task:
+                summary_by_task.setdefault(
+                    interrupted_task,
+                    {
+                        "task_id": interrupted_task,
+                        "task_name": task_name_by_id.get(
+                            interrupted_task, interrupted_task
+                        ),
+                        "world_id": world_id,
+                        "return_code": 130,
+                        "agent_status": "interrupted",
+                        "final_score": None,
+                    },
+                )
+                stop_reason = f"Interrupted by user (Ctrl+C) while running task {interrupted_task}"
+            else:
+                stop_reason = "Interrupted by user (Ctrl+C)"
+            log(f"Stopping world run: {stop_reason}")
+
+        summary = _write_world_summary(
+            summary_file=summary_file,
+            world_id=world_id,
+            world_name=world_name,
+            world_tasks=world_tasks,
+            summary_by_task=summary_by_task,
+            stop_reason=stop_reason,
+        )
 
         success_count = sum(1 for s in summary if s["return_code"] == 0)
         failure_count = len(summary) - success_count

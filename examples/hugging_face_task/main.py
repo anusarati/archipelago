@@ -138,6 +138,45 @@ def tar_gz_to_zip(tar_gz_path: Path) -> Path:
     return zip_path
 
 
+def _parse_existing_world_summary(
+    summary_file: Path, world_tasks: list[dict[str, object]]
+) -> tuple[dict[str, dict[str, object]], str | None]:
+    """Load existing world summary entries keyed by task_id."""
+    if not summary_file.exists():
+        return {}, None
+
+    try:
+        with open(summary_file) as f:
+            payload = json.load(f)
+    except Exception as e:
+        log(f"WARNING: Could not read existing summary at {summary_file}: {e}")
+        return {}, None
+
+    raw_summary = payload.get("summary", [])
+    if not isinstance(raw_summary, list):
+        return {}, None
+
+    valid_task_ids = {
+        str(t.get("task_id")) for t in world_tasks if isinstance(t.get("task_id"), str)
+    }
+    summary_by_task: dict[str, dict[str, object]] = {}
+    for entry in raw_summary:
+        if not isinstance(entry, dict):
+            continue
+        task_id = entry.get("task_id")
+        if not isinstance(task_id, str):
+            continue
+        if task_id not in valid_task_ids:
+            continue
+        summary_by_task[task_id] = dict(entry)
+
+    old_stop_reason = payload.get("stop_reason")
+    if old_stop_reason is not None and not isinstance(old_stop_reason, str):
+        old_stop_reason = None
+
+    return summary_by_task, old_stop_reason
+
+
 def main():
     # Parse task selector from command line (index, task ID, or use default)
     task_selector = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TASK
@@ -187,14 +226,32 @@ def main():
 
         summary_dir = EXAMPLE_DIR / "output" / world_id
         summary_dir.mkdir(parents=True, exist_ok=True)
-        summary: list[dict[str, object]] = []
+        summary_file = summary_dir / "summary.json"
+        summary_by_task: dict[str, dict[str, object]] = {}
         script_path = Path(__file__).resolve()
         stop_reason: str | None = None
         continue_on_infra_failure = (
             os.environ.get("WORLD_CONTINUE_ON_INFRA_FAILURE", "false").lower()
             in ("1", "true", "yes")
         )
+        world_resume = env_truthy("WORLD_RESUME", default=True)
         reuse_world_environment = env_truthy("WORLD_REUSE_ENVIRONMENT", default=True)
+
+        if world_resume:
+            summary_by_task, old_stop_reason = _parse_existing_world_summary(
+                summary_file, world_tasks
+            )
+            completed_task_ids = {
+                task_id
+                for task_id, entry in summary_by_task.items()
+                if entry.get("return_code") == 0
+            }
+            if completed_task_ids:
+                log(
+                    f"Resuming world run from existing summary: {len(completed_task_ids)} completed task(s) will be skipped"
+                )
+            if old_stop_reason:
+                log(f"Previous world run stop reason: {old_stop_reason}")
 
         if reuse_world_environment:
             log("Ensuring shared environment for world run...")
@@ -210,6 +267,11 @@ def main():
                 total=len(world_tasks),
                 msg=f"Running {task_id} ({task_name})",
             )
+
+            existing_entry = summary_by_task.get(task_id)
+            if world_resume and existing_entry and existing_entry.get("return_code") == 0:
+                log(f"Skipping completed task from previous run: {task_id}")
+                continue
 
             child_env = os.environ.copy()
             child_env["HF_TASKS_JSON_PATH"] = str(tasks_path)
@@ -238,16 +300,14 @@ def main():
                     grades = json.load(f)
                 final_score = grades.get("scoring_results", {}).get("final_score")
 
-            summary.append(
-                {
-                    "task_id": task_id,
-                    "task_name": task_name,
-                    "world_id": world_id,
-                    "return_code": result.returncode,
-                    "agent_status": trajectory_status,
-                    "final_score": final_score,
-                }
-            )
+            summary_by_task[task_id] = {
+                "task_id": task_id,
+                "task_name": task_name,
+                "world_id": world_id,
+                "return_code": result.returncode,
+                "agent_status": trajectory_status,
+                "final_score": final_score,
+            }
 
             if result.returncode == INFRA_FAILURE_EXIT_CODE:
                 stop_reason = (
@@ -262,7 +322,11 @@ def main():
                     log("Stopping world run early due to infra failure")
                     break
 
-        summary_file = summary_dir / "summary.json"
+        summary = [
+            summary_by_task[t["task_id"]]
+            for t in world_tasks
+            if t["task_id"] in summary_by_task
+        ]
         with open(summary_file, "w") as f:
             json.dump(
                 {

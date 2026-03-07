@@ -132,6 +132,21 @@ World runs now reuse one environment container by default (`WORLD_REUSE_ENVIRONM
 WORLD_REUSE_ENVIRONMENT=false ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
 ```
 
+### Resume World Runs
+
+World mode resumes by default (`WORLD_RESUME=true`) using `output/<world_id>/summary.json`:
+
+- Completed tasks (`return_code == 0`) are skipped
+- Failed/incomplete tasks are re-run
+
+```bash
+# default: resume from existing summary
+./run.sh world_eec3883ca3c54c41a62d3f220a27736c
+
+# force a full rerun of all tasks
+WORLD_RESUME=false ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
+```
+
 ## Available MCP Servers
 
 | Server | Description |

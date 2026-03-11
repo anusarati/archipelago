@@ -215,11 +215,35 @@ def _write_world_summary(
     return summary
 
 
-def _is_resume_completed_task(entry: dict[str, object] | None) -> bool:
-    """Only skip tasks that fully completed agent execution in prior runs."""
+def _should_retry_task_on_resume(entry: dict[str, object] | None) -> bool:
+    """Return True when a prior task outcome should be retried on world resume."""
     if not entry:
-        return False
-    return entry.get("return_code") == 0 and entry.get("agent_status") == "completed"
+        return True
+
+    return_code = entry.get("return_code")
+    status = entry.get("agent_status")
+
+    # Environment/bootstrap failure while configuring MCP servers.
+    if return_code == INFRA_FAILURE_EXIT_CODE:
+        return True
+
+    # Transient/system errors (e.g., API rate limits/timeouts/provider issues).
+    if status == "error":
+        return True
+
+    # User interruptions, cancellations, or missing/unknown status should rerun.
+    if status in ("cancelled", "interrupted", None):
+        return True
+
+    # Non-zero script exit with non-terminal status should rerun.
+    if isinstance(return_code, int) and return_code != 0 and status not in (
+        "completed",
+        "failed",
+    ):
+        return True
+
+    # Terminal outcomes: completed or failed (e.g., max-steps/turn-limit).
+    return False
 
 
 def main():
@@ -286,14 +310,23 @@ def main():
             summary_by_task, old_stop_reason = _parse_existing_world_summary(
                 summary_file, world_tasks
             )
-            completed_task_ids = {
+            skipped_task_ids = {
                 task_id
                 for task_id, entry in summary_by_task.items()
-                if _is_resume_completed_task(entry)
+                if not _should_retry_task_on_resume(entry)
             }
-            if completed_task_ids:
+            retry_task_ids = {
+                task_id
+                for task_id, entry in summary_by_task.items()
+                if _should_retry_task_on_resume(entry)
+            }
+            if skipped_task_ids:
                 log(
-                    f"Resuming world run from existing summary: {len(completed_task_ids)} completed task(s) will be skipped"
+                    f"Resuming world run from existing summary: {len(skipped_task_ids)} terminal task(s) will be skipped"
+                )
+            if retry_task_ids:
+                log(
+                    f"Resuming world run from existing summary: {len(retry_task_ids)} retryable task(s) will be rerun"
                 )
             if old_stop_reason:
                 log(f"Previous world run stop reason: {old_stop_reason}")
@@ -320,12 +353,14 @@ def main():
                 )
 
                 existing_entry = summary_by_task.get(task_id)
-                if world_resume and _is_resume_completed_task(existing_entry):
-                    log(f"Skipping completed task from previous run: {task_id}")
+                if world_resume and existing_entry and not _should_retry_task_on_resume(
+                    existing_entry
+                ):
+                    log(f"Skipping terminal task from previous run: {task_id}")
                     continue
                 if world_resume and existing_entry:
                     log(
-                        "Retrying task from previous run due to incomplete status: "
+                        "Retrying task from previous run due to retryable status: "
                         f"{task_id} (return_code={existing_entry.get('return_code')}, "
                         f"agent_status={existing_entry.get('agent_status')})"
                     )

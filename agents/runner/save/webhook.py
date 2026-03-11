@@ -36,9 +36,14 @@ async def report_trajectory_result(
         logger.warning("No webhook URL/API key configured, skipping result reporting")
         return
 
+    try:
+        trajectory_json = output.model_dump_json(warnings=False)
+    except TypeError:
+        trajectory_json = output.model_dump_json()
+
     payload = {
         "trajectory_id": trajectory_id,
-        "trajectory_json": output.model_dump_json(),
+        "trajectory_json": trajectory_json,
         "trajectory_snapshot_id": snapshot_id if snapshot_id else None,
     }
 

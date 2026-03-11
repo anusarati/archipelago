@@ -29,30 +29,51 @@ if settings.LITELLM_PROXY_API_BASE and settings.LITELLM_PROXY_API_KEY:
     litellm.use_litellm_proxy = True
 
 
+def _safe_model_dump(value: Any) -> Any:
+    """Serialize pydantic-style objects without emitting noisy serializer warnings."""
+    model_dump = getattr(value, "model_dump", None)
+    if not callable(model_dump):
+        return str(value)
+
+    # pydantic v2 supports warnings=False; older implementations may not.
+    try:
+        return model_dump(mode="json", warnings=False)
+    except TypeError:
+        pass
+    except Exception:
+        return str(value)
+
+    try:
+        return model_dump(mode="json")
+    except TypeError:
+        pass
+    except Exception:
+        return str(value)
+
+    try:
+        return model_dump(warnings=False)
+    except TypeError:
+        pass
+    except Exception:
+        return str(value)
+
+    try:
+        return model_dump()
+    except Exception:
+        return str(value)
+
+
 def _serialize_any_message(msg: LitellmAnyMessage) -> Any:
     """Convert a LiteLLM message object to JSON-friendly data for logging."""
     if isinstance(msg, dict):
         return msg
 
-    model_dump = getattr(msg, "model_dump", None)
-    if callable(model_dump):
-        try:
-            return model_dump(mode="json")
-        except TypeError:
-            return model_dump()
-
-    return str(msg)
+    return _safe_model_dump(msg)
 
 
 def _serialize_model_response(response: ModelResponse) -> Any:
     """Convert ModelResponse to JSON-friendly data for logging."""
-    model_dump = getattr(response, "model_dump", None)
-    if callable(model_dump):
-        try:
-            return model_dump(mode="json")
-        except TypeError:
-            return model_dump()
-    return str(response)
+    return _safe_model_dump(response)
 
 
 def _is_context_window_error(e: Exception) -> bool:
@@ -299,9 +320,7 @@ async def call_responses_api(
         logger.bind(
             message_type="llm_response",
             model=model,
-            payload=completed_response.model_dump()
-            if hasattr(completed_response, "model_dump")
-            else str(completed_response),
+            payload=_safe_model_dump(completed_response),
         ).info("LLM response")
         return completed_response
 
@@ -309,6 +328,6 @@ async def call_responses_api(
     logger.bind(
         message_type="llm_response",
         model=model,
-        payload=response.model_dump() if hasattr(response, "model_dump") else str(response),
+        payload=_safe_model_dump(response),
     ).info("LLM response")
     return response

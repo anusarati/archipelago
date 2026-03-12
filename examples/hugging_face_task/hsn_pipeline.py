@@ -12,6 +12,7 @@ import hashlib
 import gzip
 import warnings
 import zipfile
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -46,8 +47,16 @@ HSN_EMBEDDING_TIMEOUT_SECONDS = float(
 )
 HSN_MAX_TEXT_CHARS = int(os.environ.get("HSN_MAX_TEXT_CHARS", "131072"))
 HSN_MAX_FILES = int(os.environ.get("HSN_MAX_FILES", "5000"))
-HSN_EXTRACTION_CACHE_VERSION = 1
+HSN_EXTRACTION_CACHE_VERSION = 2
 HSN_MAX_GARBLED_WARNINGS = int(os.environ.get("HSN_MAX_GARBLED_WARNINGS", "20"))
+HSN_PDF_OCR_DPI = int(os.environ.get("HSN_PDF_OCR_DPI", "150"))
+HSN_PDF_OCR_MAX_PAGES = int(os.environ.get("HSN_PDF_OCR_MAX_PAGES", "128"))
+HSN_PDF_OCR_LANG = os.environ.get("HSN_PDF_OCR_LANG", "eng")
+HSN_PDF_OCR_CONFIG = os.environ.get("HSN_PDF_OCR_CONFIG", "--psm 6")
+HSN_PDF_OCR_PAGE_TIMEOUT_SECONDS = int(
+    os.environ.get("HSN_PDF_OCR_PAGE_TIMEOUT_SECONDS", "20")
+)
+HSN_PDF_OCR_THREAD_COUNT = int(os.environ.get("HSN_PDF_OCR_THREAD_COUNT", "2"))
 
 DOCUMENT_EXTENSIONS = {
     "txt",
@@ -121,7 +130,8 @@ def _build_converter() -> Any:
         from markitdown import MarkItDown  # import locally for optional dependency
     except Exception as exc:
         raise RuntimeError(
-            "HSN mode requires markitdown. Install dependencies with `cd agents && uv sync`."
+            "HSN mode requires markitdown for non-PDF document extraction. "
+            "Install dependencies with `cd agents && uv sync`."
         ) from exc
     return MarkItDown()
 
@@ -166,10 +176,68 @@ def _load_embedding_extra_args() -> dict[str, Any]:
     return payload
 
 
-def _extract_text(path: str, data: bytes, converter: Any) -> str:
+def _extract_pdf_text_with_ocr(path: str, data: bytes, log: Callable[[str], None]) -> str:
+    try:
+        from pdf2image import convert_from_bytes
+        import pytesseract
+    except Exception as exc:
+        raise RuntimeError(
+            "HSN PDF OCR requires `pdf2image` and `pytesseract`. Install with `cd agents && uv sync`."
+        ) from exc
+
+    if shutil.which("tesseract") is None:
+        log(f"  WARNING: PDF OCR skipped for {path}: `tesseract` binary not found")
+        return ""
+    if shutil.which("pdftoppm") is None and shutil.which("pdftocairo") is None:
+        log(
+            f"  WARNING: PDF OCR skipped for {path}: Poppler binary (`pdftoppm`/`pdftocairo`) not found"
+        )
+        return ""
+
+    try:
+        pages = convert_from_bytes(
+            data,
+            dpi=HSN_PDF_OCR_DPI,
+            first_page=1,
+            last_page=max(1, HSN_PDF_OCR_MAX_PAGES),
+            thread_count=max(1, HSN_PDF_OCR_THREAD_COUNT),
+        )
+    except Exception as exc:
+        log(f"  WARNING: PDF OCR failed for {path}: {exc}")
+        return ""
+
+    chunks: list[str] = []
+    total_chars = 0
+    for page_num, page_image in enumerate(pages, start=1):
+        try:
+            page_text = pytesseract.image_to_string(
+                page_image,
+                lang=HSN_PDF_OCR_LANG,
+                config=HSN_PDF_OCR_CONFIG,
+                timeout=max(1, HSN_PDF_OCR_PAGE_TIMEOUT_SECONDS),
+            )
+        except Exception as exc:
+            log(f"  WARNING: PDF OCR page {page_num} failed for {path}: {exc}")
+            continue
+
+        if page_text:
+            chunks.append(page_text)
+            total_chars += len(page_text)
+            if total_chars >= HSN_MAX_TEXT_CHARS:
+                break
+
+    text = "\n".join(chunks).strip()
+    if not text:
+        log(f"  WARNING: PDF OCR produced empty/whitespace text for {path}")
+    return text[:HSN_MAX_TEXT_CHARS]
+
+
+def _extract_text(path: str, data: bytes, converter: Any, log: Callable[[str], None]) -> str:
     ext = _extension(path)
     if ext in TEXT_EXTENSIONS:
         return data.decode("utf-8", errors="ignore")[:HSN_MAX_TEXT_CHARS]
+    if ext == "pdf":
+        return _extract_pdf_text_with_ocr(path, data, log)
 
     try:
         document = converter.convert(io.BytesIO(data))
@@ -276,7 +344,7 @@ def _collect_documents(world_zip: Path, log: Callable[[str], None]) -> list[dict
         start_time = time.time()
         for i, (name, rel_path) in enumerate(candidates, start=1):
             data = zf.read(name)
-            text = _extract_text(rel_path, data, converter)
+            text = _extract_text(rel_path, data, converter, log)
             docs.append(
                 {
                     "id": str(len(docs) + 1),
@@ -453,6 +521,13 @@ def _load_or_collect_documents(
         "max_text_chars": HSN_MAX_TEXT_CHARS,
         "max_files": HSN_MAX_FILES,
         "markitdown_version": _markitdown_version(),
+        "pdf_extraction_method": "pdf2image+pytesseract",
+        "pdf_ocr_dpi": HSN_PDF_OCR_DPI,
+        "pdf_ocr_max_pages": HSN_PDF_OCR_MAX_PAGES,
+        "pdf_ocr_lang": HSN_PDF_OCR_LANG,
+        "pdf_ocr_config": HSN_PDF_OCR_CONFIG,
+        "pdf_ocr_page_timeout_seconds": HSN_PDF_OCR_PAGE_TIMEOUT_SECONDS,
+        "pdf_ocr_thread_count": HSN_PDF_OCR_THREAD_COUNT,
     }
 
     extraction_cache_dir = _extraction_cache_dir_for_world(world_id)

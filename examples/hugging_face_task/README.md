@@ -158,12 +158,18 @@ USE_HSN_FILESYSTEM=true ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
 In HSN mode:
 
 - The runner builds and caches per-world document embeddings and an HSN tree at `~/.cache/archipelago/hsn/<world_id>/<embedding_model>/hsn_index.json`
-- MarkItDown extraction output is cached per world at `~/.cache/archipelago/hsn/<world_id>/_extraction/documents_with_text.json.gz`
-- Extraction cache is invalidated automatically when the world snapshot hash, `HSN_MAX_TEXT_CHARS`, `HSN_MAX_FILES`, or MarkItDown version changes
+- Document extraction output is cached per world at `~/.cache/archipelago/hsn/<world_id>/_extraction/documents_with_text.json.gz`
+- PDF extraction uses `pdf2image + pytesseract` OCR (MarkItDown is not used for PDFs)
+- Extraction cache is invalidated automatically when the world snapshot hash, extraction settings, or MarkItDown version changes
 - Cached HSN artifacts are reused across future runs for that same world
 - A system message is injected before the user prompt, describing HSN semantics and listing top-level files with ID paths
 - `filesystem_server.list_files` annotates file entries with HSN paths and accepts file paths (returns top-10 HSN children)
 - `filesystem_server.search_files` also annotates matched files with HSN paths
+
+Host prerequisites for PDF OCR:
+
+- `tesseract` binary in `PATH`
+- Poppler binary in `PATH` (`pdftoppm` or `pdftocairo`)
 
 Embedding model is configurable:
 
@@ -194,6 +200,17 @@ Optional embedding timeout (seconds):
 
 ```bash
 HSN_EMBEDDING_TIMEOUT_SECONDS=180
+```
+
+Optional PDF OCR tuning:
+
+```bash
+HSN_PDF_OCR_DPI=150
+HSN_PDF_OCR_MAX_PAGES=128
+HSN_PDF_OCR_LANG=eng
+HSN_PDF_OCR_CONFIG="--psm 6"
+HSN_PDF_OCR_PAGE_TIMEOUT_SECONDS=20
+HSN_PDF_OCR_THREAD_COUNT=2
 ```
 
 ## Available MCP Servers

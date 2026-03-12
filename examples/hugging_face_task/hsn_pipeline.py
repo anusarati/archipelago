@@ -30,6 +30,8 @@ HSN_EMBEDDING_MODEL = os.environ.get(
     "HSN_EMBEDDING_MODEL", "openai/text-embedding-3-small"
 )
 HSN_EMBEDDING_BATCH_SIZE = int(os.environ.get("HSN_EMBEDDING_BATCH_SIZE", "32"))
+HSN_EMBEDDING_API_KEY = os.environ.get("HSN_EMBEDDING_API_KEY")
+HSN_EMBEDDING_BASE_URL = os.environ.get("HSN_EMBEDDING_BASE_URL")
 HSN_MAX_TEXT_CHARS = int(os.environ.get("HSN_MAX_TEXT_CHARS", "12000"))
 HSN_MAX_FILES = int(os.environ.get("HSN_MAX_FILES", "5000"))
 
@@ -196,11 +198,17 @@ def _extract_embeddings(texts: list[str], log: Callable[[str], None]) -> np.ndar
         end = min(total, start + HSN_EMBEDDING_BATCH_SIZE)
         batch = texts[start:end]
         log(f"  HSN: embedding batch {start + 1}-{end}/{total}")
-        response = litellm.embedding(
-            model=HSN_EMBEDDING_MODEL,
-            input=batch,
+        kwargs: dict[str, Any] = {
+            "model": HSN_EMBEDDING_MODEL,
+            "input": batch,
             **extra_args,
-        )
+        }
+        if HSN_EMBEDDING_API_KEY:
+            kwargs["api_key"] = HSN_EMBEDDING_API_KEY
+        if HSN_EMBEDDING_BASE_URL:
+            kwargs["api_base"] = HSN_EMBEDDING_BASE_URL
+
+        response = litellm.embedding(**kwargs)
 
         data = getattr(response, "data", None)
         if data is None and isinstance(response, dict):

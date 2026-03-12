@@ -172,6 +172,16 @@ HSN_EMBEDDING_BATCH_SIZE=32 \
 ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
 ```
 
+You can override embedding auth + endpoint directly (useful when you are not running a LiteLLM proxy):
+
+```bash
+USE_HSN_FILESYSTEM=true \
+HSN_EMBEDDING_MODEL=openai/text-embedding-3-small \
+HSN_EMBEDDING_API_KEY=sk-... \
+HSN_EMBEDDING_BASE_URL=https://api.openai.com/v1 \
+./run.sh world_eec3883ca3c54c41a62d3f220a27736c
+```
+
 Optional extra embedding parameters can be passed as JSON:
 
 ```bash

@@ -29,7 +29,7 @@ HSN_CACHE_ROOT = Path(
 HSN_EMBEDDING_MODEL = os.environ.get(
     "HSN_EMBEDDING_MODEL", "openai/text-embedding-3-small"
 )
-HSN_EMBEDDING_BATCH_SIZE = int(os.environ.get("HSN_EMBEDDING_BATCH_SIZE", "32"))
+HSN_EMBEDDING_BATCH_SIZE = int(os.environ.get("HSN_EMBEDDING_BATCH_SIZE", "1024"))
 HSN_EMBEDDING_API_KEY = os.environ.get("HSN_EMBEDDING_API_KEY")
 HSN_EMBEDDING_BASE_URL = os.environ.get("HSN_EMBEDDING_BASE_URL")
 HSN_MAX_TEXT_CHARS = int(os.environ.get("HSN_MAX_TEXT_CHARS", "12000"))

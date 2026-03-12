@@ -158,6 +158,8 @@ USE_HSN_FILESYSTEM=true ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
 In HSN mode:
 
 - The runner builds and caches per-world document embeddings and an HSN tree at `~/.cache/archipelago/hsn/<world_id>/<embedding_model>/hsn_index.json`
+- MarkItDown extraction output is cached per world at `~/.cache/archipelago/hsn/<world_id>/_extraction/documents_with_text.json.gz`
+- Extraction cache is invalidated automatically when the world snapshot hash, `HSN_MAX_TEXT_CHARS`, `HSN_MAX_FILES`, or MarkItDown version changes
 - Cached HSN artifacts are reused across future runs for that same world
 - A system message is injected before the user prompt, describing HSN semantics and listing top-level files with ID paths
 - `filesystem_server.list_files` annotates file entries with HSN paths and accepts file paths (returns top-10 HSN children)

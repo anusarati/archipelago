@@ -8,6 +8,8 @@ import re
 import sys
 import tarfile
 import time
+import hashlib
+import gzip
 import warnings
 import zipfile
 from dataclasses import dataclass
@@ -44,6 +46,7 @@ HSN_EMBEDDING_TIMEOUT_SECONDS = float(
 )
 HSN_MAX_TEXT_CHARS = int(os.environ.get("HSN_MAX_TEXT_CHARS", "131072"))
 HSN_MAX_FILES = int(os.environ.get("HSN_MAX_FILES", "5000"))
+HSN_EXTRACTION_CACHE_VERSION = 1
 
 DOCUMENT_EXTENSIONS = {
     "txt",
@@ -271,8 +274,117 @@ def _sanitize_model_name(model: str) -> str:
     return slug.strip("_") or "default_model"
 
 
+def _cache_root_for_world(world_id: str) -> Path:
+    return HSN_CACHE_ROOT / world_id
+
+
 def _cache_dir_for_world(world_id: str) -> Path:
-    return HSN_CACHE_ROOT / world_id / _sanitize_model_name(HSN_EMBEDDING_MODEL)
+    return _cache_root_for_world(world_id) / _sanitize_model_name(HSN_EMBEDDING_MODEL)
+
+
+def _extraction_cache_dir_for_world(world_id: str) -> Path:
+    return _cache_root_for_world(world_id) / "_extraction"
+
+
+def _sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _markitdown_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("markitdown")
+    except Exception:
+        return "unknown"
+
+
+def _load_cached_extraction(
+    extraction_cache_dir: Path, cache_key: dict[str, Any]
+) -> list[dict[str, Any]] | None:
+    docs_path = extraction_cache_dir / "documents_with_text.json.gz"
+    meta_path = extraction_cache_dir / "meta.json"
+    if not docs_path.exists() or not meta_path.exists():
+        return None
+
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if not isinstance(meta, dict):
+            return None
+        if meta.get("version") != HSN_EXTRACTION_CACHE_VERSION:
+            return None
+        if meta.get("cache_key") != cache_key:
+            return None
+        with gzip.open(docs_path, "rt", encoding="utf-8") as f:
+            docs = json.load(f)
+        if not isinstance(docs, list):
+            return None
+        return docs
+    except Exception:
+        return None
+
+
+def _save_cached_extraction(
+    extraction_cache_dir: Path,
+    docs: list[dict[str, Any]],
+    cache_key: dict[str, Any],
+) -> None:
+    extraction_cache_dir.mkdir(parents=True, exist_ok=True)
+    docs_path = extraction_cache_dir / "documents_with_text.json.gz"
+    meta_path = extraction_cache_dir / "meta.json"
+    with gzip.open(docs_path, "wt", encoding="utf-8") as f:
+        json.dump(docs, f)
+    with open(meta_path, "w") as f:
+        json.dump(
+            {
+                "version": HSN_EXTRACTION_CACHE_VERSION,
+                "cache_key": cache_key,
+                "doc_count": len(docs),
+                "created_at": int(time.time()),
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
+
+
+def _load_or_collect_documents(
+    world_id: str,
+    world_zip: Path,
+    log: Callable[[str], None],
+) -> list[dict[str, Any]]:
+    log("  HSN: computing world fingerprint for extraction cache...")
+    world_sha256 = _sha256_file(world_zip)
+    cache_key = {
+        "world_sha256": world_sha256,
+        "max_text_chars": HSN_MAX_TEXT_CHARS,
+        "max_files": HSN_MAX_FILES,
+        "markitdown_version": _markitdown_version(),
+    }
+
+    extraction_cache_dir = _extraction_cache_dir_for_world(world_id)
+    cached_docs = _load_cached_extraction(extraction_cache_dir, cache_key)
+    if cached_docs is not None:
+        log(
+            f"  HSN: extraction cache hit: {extraction_cache_dir / 'documents_with_text.json.gz'} "
+            f"({len(cached_docs)} files)"
+        )
+        return cached_docs
+
+    docs = _collect_documents(world_zip, log)
+    _save_cached_extraction(extraction_cache_dir, docs, cache_key)
+    log(
+        f"  HSN: extraction cache saved: {extraction_cache_dir / 'documents_with_text.json.gz'}"
+    )
+    return docs
 
 
 def _graph_to_index(graph: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -363,7 +475,7 @@ def _build_hsn_index(
     world_id: str, world_zip: Path, log: Callable[[str], None]
 ) -> tuple[dict[str, Any], np.ndarray, list[dict[str, Any]]]:
     collect_started = time.time()
-    docs = _collect_documents(world_zip, log)
+    docs = _load_or_collect_documents(world_id, world_zip, log)
     log(f"  HSN: text extraction completed in {time.time() - collect_started:.1f}s")
     if not docs:
         return (

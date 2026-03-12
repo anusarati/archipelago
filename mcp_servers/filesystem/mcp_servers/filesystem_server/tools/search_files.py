@@ -4,6 +4,7 @@ from typing import Annotated
 
 from pydantic import Field
 from utils.decorators import make_async_background
+from utils.hsn import annotate_path, hsn_mode_enabled, render_id_map
 
 FS_ROOT = os.getenv("APP_FS_ROOT", "/filesystem")
 
@@ -82,6 +83,7 @@ def search_files(
         raise ValueError("Path must start with /")
 
     base = _resolve_under_root(path)
+    hsn_enabled = hsn_mode_enabled()
 
     # SECURITY: Use lexists to check without following symlinks first
     if not os.path.lexists(base):
@@ -158,7 +160,19 @@ def search_files(
         return f"No files matching '{pattern}' found in {path}"
 
     result = f"Found {len(matches)} file(s) matching '{pattern}':\n"
-    result += "\n".join(matches)
+    if hsn_enabled:
+        annotated_lines: list[str] = []
+        ids_used: set[int] = set()
+        for match_path in matches:
+            annotation, ids = annotate_path(match_path)
+            ids_used.update(ids)
+            annotated_lines.append(f"{match_path} {annotation}")
+        result += "\n".join(annotated_lines)
+        id_map = render_id_map(ids_used)
+        if id_map:
+            result += f"\n\nHSN id map:\n{id_map}"
+    else:
+        result += "\n".join(matches)
 
     if max_results > 0 and count >= max_results:
         result += f"\n\n(Results limited to {max_results})"

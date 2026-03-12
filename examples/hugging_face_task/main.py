@@ -23,6 +23,7 @@ from pathlib import Path
 
 import httpx
 from huggingface_hub import hf_hub_download
+from hsn_pipeline import HSN_INDEX_REL_PATH, hsn_enabled, prepare_hsn_for_world
 
 EXAMPLE_DIR = Path(os.environ.get("EXAMPLE_DIR", Path(__file__).parent))
 ARCHIPELAGO_DIR = Path(os.environ.get("ARCHIPELAGO_DIR", EXAMPLE_DIR.parent.parent))
@@ -504,8 +505,10 @@ def main():
     log(f"World: {world['world_name']}")
     log(f"Prompt: {task['prompt'][:100]}...")
     log("=" * 60)
+    hsn_mode_enabled = hsn_enabled()
+    hsn_initial_message: str | None = None
     step = 0
-    total_steps = 7
+    total_steps = 8 if hsn_mode_enabled else 7
 
     step += 1
     skip_start_environment = env_truthy("HF_SKIP_START_ENVIRONMENT", default=False)
@@ -584,6 +587,26 @@ def main():
                     sys.exit(1)
                 log(f"  {subsystem}: {resp.json()}")
 
+    if hsn_mode_enabled:
+        step += 1
+        log_progress(task["task_id"], step, total_steps, "Preparing HSN data structure")
+        log("Preparing HSN cache for this world...")
+        try:
+            prepared_hsn = prepare_hsn_for_world(
+                world_id=world_id,
+                world_zip=world_zip,
+                output_dir=output_dir,
+                env_url=ENV_URL,
+                log=log,
+            )
+            log(
+                f"  HSN cache: {prepared_hsn.index_path} (document-like files: {prepared_hsn.index_data.get('file_count', 0)})"
+            )
+            hsn_initial_message = prepared_hsn.initial_message
+        except Exception as e:
+            log(f"ERROR: Failed preparing HSN data structure: {e}")
+            sys.exit(1)
+
     # Configure MCP servers
     step += 1
     log_progress(task["task_id"], step, total_steps, "Configuring MCP servers")
@@ -640,6 +663,19 @@ def main():
 
         if unknown_services:
             log(f"  Unknown world services (ignored): {unknown_services}")
+
+    if hsn_mode_enabled:
+        servers_cfg = mcp_config.get("mcpServers")
+        if isinstance(servers_cfg, dict):
+            fs_cfg = servers_cfg.get("filesystem_server")
+            if isinstance(fs_cfg, dict):
+                env_cfg = fs_cfg.setdefault("env", {})
+                if isinstance(env_cfg, dict):
+                    env_cfg["FS_HSN_ENABLED"] = "1"
+                    env_cfg["FS_HSN_INDEX_PATH"] = f"/.apps_data/{HSN_INDEX_REL_PATH}"
+                    log("  Filesystem server: HSN mode enabled")
+            else:
+                log("  WARNING: HSN mode requested, but filesystem_server is not configured")
 
     log(f"  Servers: {list(mcp_config['mcpServers'].keys())}")
 
@@ -724,10 +760,10 @@ Don't over-explain. Be concise but show your thinking.
 - Show your work for calculations
 - `final_answer` is rejected if todos are incomplete
 """
-    initial_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task["prompt"]},
-    ]
+    initial_messages = [{"role": "system", "content": system_prompt}]
+    if hsn_initial_message:
+        initial_messages.append({"role": "system", "content": hsn_initial_message})
+    initial_messages.append({"role": "user", "content": task["prompt"]})
     with open(output_dir / "initial_messages.json", "w") as f:
         json.dump(initial_messages, f, indent=2)
 

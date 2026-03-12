@@ -147,6 +147,37 @@ World mode resumes by default (`WORLD_RESUME=true`) using `output/<world_id>/sum
 WORLD_RESUME=false ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
 ```
 
+### HSN Filesystem Mode
+
+Enable Hierarchical Semantic Navigation (HSN) mode for the filesystem server:
+
+```bash
+USE_HSN_FILESYSTEM=true ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
+```
+
+In HSN mode:
+
+- The runner builds and caches per-world document embeddings and an HSN tree at `~/.cache/archipelago/hsn/<world_id>/<embedding_model>/hsn_index.json`
+- Cached HSN artifacts are reused across future runs for that same world
+- A system message is injected before the user prompt, describing HSN semantics and listing top-level files with ID paths
+- `filesystem_server.list_files` annotates file entries with HSN paths and accepts file paths (returns top-10 HSN children)
+- `filesystem_server.search_files` also annotates matched files with HSN paths
+
+Embedding model is configurable:
+
+```bash
+USE_HSN_FILESYSTEM=true \
+HSN_EMBEDDING_MODEL=openai/text-embedding-3-small \
+HSN_EMBEDDING_BATCH_SIZE=32 \
+./run.sh world_eec3883ca3c54c41a62d3f220a27736c
+```
+
+Optional extra embedding parameters can be passed as JSON:
+
+```bash
+HSN_EMBEDDING_EXTRA_ARGS='{"dimensions":1024}'
+```
+
 ## Available MCP Servers
 
 | Server | Description |

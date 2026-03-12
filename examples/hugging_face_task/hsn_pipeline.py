@@ -272,6 +272,15 @@ def _extract_embeddings(texts: list[str], log: Callable[[str], None]) -> np.ndar
     return np.array(vectors, dtype=np.float32)
 
 
+def _build_embedding_input(path: str, text: str) -> str:
+    # Some embedding backends enforce a strict "less than N chars" limit.
+    max_total_chars = max(1, HSN_MAX_TEXT_CHARS - 1)
+    prefix = f"path: {path}\n"
+    if len(prefix) >= max_total_chars:
+        return prefix[:max_total_chars]
+    return prefix + text[: max_total_chars - len(prefix)]
+
+
 def _sanitize_model_name(model: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_.-]+", "_", model)
     return slug.strip("_") or "default_model"
@@ -500,7 +509,7 @@ def _build_hsn_index(
             docs,
         )
 
-    embed_inputs = [f"path: {doc['path']}\n{doc['text']}" for doc in docs]
+    embed_inputs = [_build_embedding_input(doc["path"], doc["text"]) for doc in docs]
     embed_started = time.time()
     embeddings = _extract_embeddings(embed_inputs, log)
     log(f"  HSN: embedding completed in {time.time() - embed_started:.1f}s")

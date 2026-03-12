@@ -47,6 +47,7 @@ HSN_EMBEDDING_TIMEOUT_SECONDS = float(
 HSN_MAX_TEXT_CHARS = int(os.environ.get("HSN_MAX_TEXT_CHARS", "131072"))
 HSN_MAX_FILES = int(os.environ.get("HSN_MAX_FILES", "5000"))
 HSN_EXTRACTION_CACHE_VERSION = 1
+HSN_MAX_GARBLED_WARNINGS = int(os.environ.get("HSN_MAX_GARBLED_WARNINGS", "20"))
 
 DOCUMENT_EXTENSIONS = {
     "txt",
@@ -183,6 +184,77 @@ def _extract_text(path: str, data: bytes, converter: Any) -> str:
     return data.decode("latin-1", errors="ignore")[:HSN_MAX_TEXT_CHARS]
 
 
+def _max_non_whitespace_run(text: str) -> int:
+    max_run = 0
+    current = 0
+    for ch in text:
+        if ch.isspace():
+            if current > max_run:
+                max_run = current
+            current = 0
+        else:
+            current += 1
+    return max(max_run, current)
+
+
+def _garbled_text_reasons(text: str) -> list[str]:
+    if not text:
+        return []
+
+    sample = text[:10000]
+    sample_len = len(sample)
+    if sample_len == 0:
+        return []
+
+    escaped_hex_sequences = len(re.findall(r"\\x[0-9A-Fa-f]{2}", sample))
+    control_chars = sum(
+        1 for ch in sample if (ord(ch) < 32 and ch not in {"\n", "\r", "\t"})
+    )
+    alpha_chars = sum(1 for ch in sample if ch.isalpha())
+    whitespace_chars = sum(1 for ch in sample if ch.isspace())
+    readable_ratio = (alpha_chars + whitespace_chars) / sample_len
+    max_token_run = _max_non_whitespace_run(sample)
+
+    reasons: list[str] = []
+    if escaped_hex_sequences >= 5:
+        reasons.append(f"many escaped hex sequences ({escaped_hex_sequences})")
+    if control_chars > 0 and (control_chars / sample_len) > 0.01:
+        reasons.append(f"control chars ratio {(control_chars / sample_len):.2%}")
+    if sample_len >= 200 and readable_ratio < 0.25:
+        reasons.append(f"low readable ratio ({readable_ratio:.2%})")
+    if sample_len >= 200 and max_token_run >= 140:
+        reasons.append(f"very long no-whitespace run ({max_token_run} chars)")
+    return reasons
+
+
+def _log_garbled_document_warnings(
+    docs: list[dict[str, Any]], log: Callable[[str], None], source: str
+) -> None:
+    warned = 0
+    suppressed = 0
+    for doc in docs:
+        path = doc.get("path")
+        text = doc.get("text")
+        if not isinstance(path, str) or not isinstance(text, str):
+            continue
+        reasons = _garbled_text_reasons(text)
+        if not reasons:
+            continue
+        if warned < HSN_MAX_GARBLED_WARNINGS:
+            preview = text[:120].encode("unicode_escape", errors="ignore").decode("ascii")
+            log(
+                "  WARNING: HSN extracted text may be garbled "
+                f"({source}) for {path}: {', '.join(reasons)} | preview={preview}"
+            )
+            warned += 1
+        else:
+            suppressed += 1
+    if suppressed:
+        log(
+            f"  WARNING: HSN garbled-text warnings suppressed for {suppressed} additional files"
+        )
+
+
 def _collect_documents(world_zip: Path, log: Callable[[str], None]) -> list[dict[str, Any]]:
     converter = _build_converter()
     docs: list[dict[str, Any]] = []
@@ -217,6 +289,7 @@ def _collect_documents(world_zip: Path, log: Callable[[str], None]) -> list[dict
                 elapsed = time.time() - start_time
                 log(f"  HSN: extracted {i}/{total_candidates} files ({elapsed:.1f}s elapsed)")
 
+    _log_garbled_document_warnings(docs, log, source="fresh extraction")
     log(f"  HSN: collected {len(docs)} document-like files")
     return docs
 
@@ -389,6 +462,7 @@ def _load_or_collect_documents(
             f"  HSN: extraction cache hit: {extraction_cache_dir / 'documents_with_text.json.gz'} "
             f"({len(cached_docs)} files)"
         )
+        _log_garbled_document_warnings(cached_docs, log, source="cache")
         return cached_docs
 
     docs = _collect_documents(world_zip, log)

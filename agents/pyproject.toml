@@ -29,6 +29,7 @@ dependencies = [
     "modal>=1.0.0",
     "networkx>=3.6.0",
     "numpy>=2.3.0",
+    "openai>=1.109.1",
     "pydantic-settings>=2.11.0",
     "redis>=6.4.0",
     "trafilatura>=1.12.0",

@@ -226,45 +226,48 @@ def _extract_embeddings(texts: list[str], log: Callable[[str], None]) -> np.ndar
         return np.zeros((0, 0), dtype=np.float32)
     if HSN_EMBEDDING_BATCH_SIZE <= 0:
         raise ValueError("HSN_EMBEDDING_BATCH_SIZE must be >= 1")
+    try:
+        from openai import OpenAI
+    except Exception as exc:
+        raise RuntimeError(
+            "HSN embeddings require the `openai` package. Install dependencies with `cd agents && uv sync`."
+        ) from exc
 
     extra_args = _load_embedding_extra_args()
     vectors: list[list[float]] = []
     total = len(texts)
     num_batches = (total + HSN_EMBEDDING_BATCH_SIZE - 1) // HSN_EMBEDDING_BATCH_SIZE
-    endpoint = f"{HSN_EMBEDDING_BASE_URL}/embeddings"
-    headers = {"Content-Type": "application/json"}
-    if HSN_EMBEDDING_API_KEY:
-        headers["Authorization"] = f"Bearer {HSN_EMBEDDING_API_KEY}"
+    client = OpenAI(
+        api_key=HSN_EMBEDDING_API_KEY,
+        base_url=HSN_EMBEDDING_BASE_URL,
+        timeout=HSN_EMBEDDING_TIMEOUT_SECONDS,
+    )
 
-    with httpx.Client(timeout=HSN_EMBEDDING_TIMEOUT_SECONDS) as client:
-        for batch_idx, start in enumerate(range(0, total, HSN_EMBEDDING_BATCH_SIZE), start=1):
-            end = min(total, start + HSN_EMBEDDING_BATCH_SIZE)
-            batch = texts[start:end]
-            log(f"  HSN: embedding batch {batch_idx}/{num_batches} ({start + 1}-{end}/{total})")
-            payload: dict[str, Any] = {
-                "model": HSN_EMBEDDING_MODEL,
-                "input": batch,
-                **extra_args,
-            }
-            response = client.post(endpoint, headers=headers, json=payload)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                snippet = exc.response.text[:500] if exc.response is not None else ""
-                raise RuntimeError(
-                    f"Embedding request failed ({exc.response.status_code}): {snippet}"
-                ) from exc
+    for batch_idx, start in enumerate(range(0, total, HSN_EMBEDDING_BATCH_SIZE), start=1):
+        end = min(total, start + HSN_EMBEDDING_BATCH_SIZE)
+        batch = texts[start:end]
+        log(f"  HSN: embedding batch {batch_idx}/{num_batches} ({start + 1}-{end}/{total})")
+        payload: dict[str, Any] = {
+            "model": HSN_EMBEDDING_MODEL,
+            "input": batch,
+            **extra_args,
+        }
+        try:
+            response = client.embeddings.create(**payload)
+        except Exception as exc:
+            raise RuntimeError(f"Embedding request failed: {exc}") from exc
 
-            parsed = response.json()
-            data = parsed.get("data") if isinstance(parsed, dict) else None
-            if not isinstance(data, list) or len(data) != len(batch):
-                raise RuntimeError("Unexpected embedding response shape from embedding endpoint")
+        data = getattr(response, "data", None)
+        if not isinstance(data, list) or len(data) != len(batch):
+            raise RuntimeError("Unexpected embedding response shape from embedding endpoint")
 
-            for item in data:
-                embedding = item.get("embedding") if isinstance(item, dict) else None
-                if not isinstance(embedding, list):
-                    raise RuntimeError("Missing embedding vector in embedding response")
-                vectors.append([float(v) for v in embedding])
+        for item in data:
+            embedding = getattr(item, "embedding", None)
+            if embedding is None and isinstance(item, dict):
+                embedding = item.get("embedding")
+            if not isinstance(embedding, list):
+                raise RuntimeError("Missing embedding vector in embedding response")
+            vectors.append([float(v) for v in embedding])
 
     return np.array(vectors, dtype=np.float32)
 

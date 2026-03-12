@@ -46,4 +46,9 @@ cd "$GRADING_DIR"
 uv sync
 
 # Run main.py with any arguments passed to this script
-cd "$AGENTS_DIR" && uv run python "$EXAMPLE_DIR/main.py" "$@"
+UV_RUN_ENV_ARGS=()
+if [ -f "$AGENTS_DIR/.env" ]; then
+  UV_RUN_ENV_ARGS+=(--env-file "$AGENTS_DIR/.env")
+fi
+
+cd "$AGENTS_DIR" && uv run "${UV_RUN_ENV_ARGS[@]}" python "$EXAMPLE_DIR/main.py" "$@"

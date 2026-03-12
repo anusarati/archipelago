@@ -174,7 +174,7 @@ HSN_EMBEDDING_BATCH_SIZE=32 \
 ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
 ```
 
-HSN embeddings use a direct OpenAI-compatible `POST /embeddings` call. You can override auth + endpoint:
+HSN embeddings use the `openai` Python client against an OpenAI-compatible endpoint. You can override auth + endpoint:
 
 ```bash
 USE_HSN_FILESYSTEM=true \

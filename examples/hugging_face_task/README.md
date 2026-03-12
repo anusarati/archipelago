@@ -172,13 +172,13 @@ HSN_EMBEDDING_BATCH_SIZE=32 \
 ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
 ```
 
-You can override embedding auth + endpoint directly (useful when you are not running a LiteLLM proxy):
+HSN embeddings use a direct OpenAI-compatible `POST /embeddings` call. You can override auth + endpoint:
 
 ```bash
 USE_HSN_FILESYSTEM=true \
-HSN_EMBEDDING_MODEL=openai/text-embedding-3-small \
+HSN_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B \
 HSN_EMBEDDING_API_KEY=sk-... \
-HSN_EMBEDDING_BASE_URL=https://api.openai.com/v1 \
+HSN_EMBEDDING_BASE_URL=https://api.deepinfra.com/v1/openai \
 ./run.sh world_eec3883ca3c54c41a62d3f220a27736c
 ```
 
@@ -186,6 +186,12 @@ Optional extra embedding parameters can be passed as JSON:
 
 ```bash
 HSN_EMBEDDING_EXTRA_ARGS='{"dimensions":1024}'
+```
+
+Optional embedding timeout (seconds):
+
+```bash
+HSN_EMBEDDING_TIMEOUT_SECONDS=180
 ```
 
 ## Available MCP Servers

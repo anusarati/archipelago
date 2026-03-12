@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
 import sys
 import tarfile
 import time
+import warnings
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
-import litellm
 import numpy as np
 
 ARCHIPELAGO_DIR = Path(__file__).resolve().parents[2]
@@ -30,8 +31,17 @@ HSN_EMBEDDING_MODEL = os.environ.get(
     "HSN_EMBEDDING_MODEL", "openai/text-embedding-3-small"
 )
 HSN_EMBEDDING_BATCH_SIZE = int(os.environ.get("HSN_EMBEDDING_BATCH_SIZE", "1024"))
-HSN_EMBEDDING_API_KEY = os.environ.get("HSN_EMBEDDING_API_KEY")
-HSN_EMBEDDING_BASE_URL = os.environ.get("HSN_EMBEDDING_BASE_URL")
+HSN_EMBEDDING_API_KEY = os.environ.get("HSN_EMBEDDING_API_KEY") or os.environ.get(
+    "OPENAI_API_KEY"
+)
+HSN_EMBEDDING_BASE_URL = (
+    os.environ.get("HSN_EMBEDDING_BASE_URL")
+    or os.environ.get("OPENAI_BASE_URL")
+    or "https://api.openai.com/v1"
+).rstrip("/")
+HSN_EMBEDDING_TIMEOUT_SECONDS = float(
+    os.environ.get("HSN_EMBEDDING_TIMEOUT_SECONDS", "180")
+)
 HSN_MAX_TEXT_CHARS = int(os.environ.get("HSN_MAX_TEXT_CHARS", "131072"))
 HSN_MAX_FILES = int(os.environ.get("HSN_MAX_FILES", "5000"))
 
@@ -91,7 +101,18 @@ def hsn_enabled() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _configure_document_extraction_logging() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message="Unknown extension is not supported and will be removed",
+        module=r"openpyxl\.worksheet\._reader",
+    )
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
+    logging.getLogger("pdfminer.pdffont").setLevel(logging.ERROR)
+
+
 def _build_converter() -> Any:
+    _configure_document_extraction_logging()
     try:
         from markitdown import MarkItDown  # import locally for optional dependency
     except Exception as exc:
@@ -142,6 +163,10 @@ def _load_embedding_extra_args() -> dict[str, Any]:
 
 
 def _extract_text(path: str, data: bytes, converter: Any) -> str:
+    ext = _extension(path)
+    if ext in TEXT_EXTENSIONS:
+        return data.decode("utf-8", errors="ignore")[:HSN_MAX_TEXT_CHARS]
+
     try:
         document = converter.convert(io.BytesIO(data))
         text = getattr(document, "text_content", None)
@@ -152,9 +177,6 @@ def _extract_text(path: str, data: bytes, converter: Any) -> str:
     except Exception:
         pass
 
-    ext = _extension(path)
-    if ext in TEXT_EXTENSIONS:
-        return data.decode("utf-8", errors="ignore")[:HSN_MAX_TEXT_CHARS]
     return data.decode("latin-1", errors="ignore")[:HSN_MAX_TEXT_CHARS]
 
 
@@ -165,10 +187,19 @@ def _collect_documents(world_zip: Path, log: Callable[[str], None]) -> list[dict
         names = sorted(
             n for n in zf.namelist() if n.startswith("filesystem/") and not n.endswith("/")
         )
+        candidates: list[tuple[str, str]] = []
         for name in names:
             rel_path = _normalize_path(name[len("filesystem/") :])
             if not _document_like(rel_path):
                 continue
+            candidates.append((name, rel_path))
+            if len(candidates) >= HSN_MAX_FILES:
+                break
+
+        total_candidates = len(candidates)
+        log(f"  HSN: extracting text from {total_candidates} document-like files")
+        start_time = time.time()
+        for i, (name, rel_path) in enumerate(candidates, start=1):
             data = zf.read(name)
             text = _extract_text(rel_path, data, converter)
             docs.append(
@@ -179,8 +210,9 @@ def _collect_documents(world_zip: Path, log: Callable[[str], None]) -> list[dict
                     "text": text,
                 }
             )
-            if len(docs) >= HSN_MAX_FILES:
-                break
+            if i == total_candidates or i % 10 == 0:
+                elapsed = time.time() - start_time
+                log(f"  HSN: extracted {i}/{total_candidates} files ({elapsed:.1f}s elapsed)")
 
     log(f"  HSN: collected {len(docs)} document-like files")
     return docs
@@ -189,41 +221,47 @@ def _collect_documents(world_zip: Path, log: Callable[[str], None]) -> list[dict
 def _extract_embeddings(texts: list[str], log: Callable[[str], None]) -> np.ndarray:
     if not texts:
         return np.zeros((0, 0), dtype=np.float32)
+    if HSN_EMBEDDING_BATCH_SIZE <= 0:
+        raise ValueError("HSN_EMBEDDING_BATCH_SIZE must be >= 1")
 
     extra_args = _load_embedding_extra_args()
     vectors: list[list[float]] = []
     total = len(texts)
+    num_batches = (total + HSN_EMBEDDING_BATCH_SIZE - 1) // HSN_EMBEDDING_BATCH_SIZE
+    endpoint = f"{HSN_EMBEDDING_BASE_URL}/embeddings"
+    headers = {"Content-Type": "application/json"}
+    if HSN_EMBEDDING_API_KEY:
+        headers["Authorization"] = f"Bearer {HSN_EMBEDDING_API_KEY}"
 
-    for start in range(0, total, HSN_EMBEDDING_BATCH_SIZE):
-        end = min(total, start + HSN_EMBEDDING_BATCH_SIZE)
-        batch = texts[start:end]
-        log(f"  HSN: embedding batch {start + 1}-{end}/{total}")
-        kwargs: dict[str, Any] = {
-            "model": HSN_EMBEDDING_MODEL,
-            "input": batch,
-            **extra_args,
-        }
-        if HSN_EMBEDDING_API_KEY:
-            kwargs["api_key"] = HSN_EMBEDDING_API_KEY
-        if HSN_EMBEDDING_BASE_URL:
-            kwargs["api_base"] = HSN_EMBEDDING_BASE_URL
+    with httpx.Client(timeout=HSN_EMBEDDING_TIMEOUT_SECONDS) as client:
+        for batch_idx, start in enumerate(range(0, total, HSN_EMBEDDING_BATCH_SIZE), start=1):
+            end = min(total, start + HSN_EMBEDDING_BATCH_SIZE)
+            batch = texts[start:end]
+            log(f"  HSN: embedding batch {batch_idx}/{num_batches} ({start + 1}-{end}/{total})")
+            payload: dict[str, Any] = {
+                "model": HSN_EMBEDDING_MODEL,
+                "input": batch,
+                **extra_args,
+            }
+            response = client.post(endpoint, headers=headers, json=payload)
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                snippet = exc.response.text[:500] if exc.response is not None else ""
+                raise RuntimeError(
+                    f"Embedding request failed ({exc.response.status_code}): {snippet}"
+                ) from exc
 
-        response = litellm.embedding(**kwargs)
+            parsed = response.json()
+            data = parsed.get("data") if isinstance(parsed, dict) else None
+            if not isinstance(data, list) or len(data) != len(batch):
+                raise RuntimeError("Unexpected embedding response shape from embedding endpoint")
 
-        data = getattr(response, "data", None)
-        if data is None and isinstance(response, dict):
-            data = response.get("data")
-        if not isinstance(data, list) or len(data) != len(batch):
-            raise RuntimeError("Unexpected embedding response shape from LiteLLM")
-
-        for item in data:
-            if isinstance(item, dict):
-                embedding = item.get("embedding")
-            else:
-                embedding = getattr(item, "embedding", None)
-            if not isinstance(embedding, list):
-                raise RuntimeError("Missing embedding vector in LiteLLM response")
-            vectors.append([float(v) for v in embedding])
+            for item in data:
+                embedding = item.get("embedding") if isinstance(item, dict) else None
+                if not isinstance(embedding, list):
+                    raise RuntimeError("Missing embedding vector in embedding response")
+                vectors.append([float(v) for v in embedding])
 
     return np.array(vectors, dtype=np.float32)
 
@@ -324,7 +362,9 @@ def _graph_to_index(graph: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
 def _build_hsn_index(
     world_id: str, world_zip: Path, log: Callable[[str], None]
 ) -> tuple[dict[str, Any], np.ndarray, list[dict[str, Any]]]:
+    collect_started = time.time()
     docs = _collect_documents(world_zip, log)
+    log(f"  HSN: text extraction completed in {time.time() - collect_started:.1f}s")
     if not docs:
         return (
             {
@@ -346,7 +386,9 @@ def _build_hsn_index(
         )
 
     embed_inputs = [f"path: {doc['path']}\n{doc['text']}" for doc in docs]
+    embed_started = time.time()
     embeddings = _extract_embeddings(embed_inputs, log)
+    log(f"  HSN: embedding completed in {time.time() - embed_started:.1f}s")
     builder = _build_hsn_builder()
     graph = builder.build(embeddings, [doc["id"] for doc in docs])
     index = _graph_to_index(graph, docs)

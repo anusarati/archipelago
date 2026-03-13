@@ -112,6 +112,11 @@ The scoring method takes the list of all `VerifierResult` objects and reduces th
    # Edit .env with your LLM API key
    ```
 
+   Optional TPM throttling (helps avoid provider tokens/minute limits):
+   - `LLM_MAX_TOKENS_PER_MINUTE` (disabled when unset)
+   - `LLM_TPM_DEFAULT_COMPLETION_TOKENS` (default: `2048`)
+   - `LLM_TPM_ESTIMATE_MULTIPLIER` (default: `1.1`)
+
 2. **Install dependencies:**
 
    ```bash

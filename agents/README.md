@@ -125,6 +125,10 @@ AGENT_REGISTRY = {
    - LLM API keys (at least one): `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`
    - AWS credentials for S3 operations (optional)
    - Redis connection (optional, for logging)
+   - Optional TPM throttling (helps avoid provider tokens/minute limits):
+     - `LLM_MAX_TOKENS_PER_MINUTE` (disabled when unset)
+     - `LLM_TPM_DEFAULT_COMPLETION_TOKENS` (default: `2048`)
+     - `LLM_TPM_ESTIMATE_MULTIPLIER` (default: `1.1`)
 
 3. **Install Dependencies:**
 

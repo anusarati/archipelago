@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     LITELLM_PROXY_API_BASE: str | None = None
     LITELLM_PROXY_API_KEY: str | None = None
 
+    # Optional token-per-minute guardrails for LLM calls
+    # Set LLM_MAX_TOKENS_PER_MINUTE to enable throttling (unset/<=0 disables it)
+    LLM_MAX_TOKENS_PER_MINUTE: int | None = 2_000_000
+    # Reserved output tokens used when max_tokens is not provided in request args
+    LLM_TPM_DEFAULT_COMPLETION_TOKENS: int = 2048
+    # Conservative multiplier applied to prompt + completion estimate
+    LLM_TPM_ESTIMATE_MULTIPLIER: float = 1.1
+
     # Scraping / web content (used by ACE link verification)
     ACE_FIRECRAWL_API_KEY: str | None = None
 

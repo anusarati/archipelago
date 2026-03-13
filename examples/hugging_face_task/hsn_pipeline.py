@@ -45,9 +45,15 @@ HSN_EMBEDDING_BASE_URL = (
 HSN_EMBEDDING_TIMEOUT_SECONDS = float(
     os.environ.get("HSN_EMBEDDING_TIMEOUT_SECONDS", "180")
 )
-HSN_MAX_TEXT_CHARS = int(os.environ.get("HSN_MAX_TEXT_CHARS", "131072"))
+_HSN_MAX_TEXT_CHARS_LEGACY = int(os.environ.get("HSN_MAX_TEXT_CHARS", "131072"))
+HSN_MAX_EXTRACTED_TEXT_CHARS = int(
+    os.environ.get("HSN_MAX_EXTRACTED_TEXT_CHARS", str(_HSN_MAX_TEXT_CHARS_LEGACY))
+)
+HSN_MAX_EMBEDDING_TEXT_CHARS = int(
+    os.environ.get("HSN_MAX_EMBEDDING_TEXT_CHARS", 65535)
+)
 HSN_MAX_FILES = int(os.environ.get("HSN_MAX_FILES", "5000"))
-HSN_EXTRACTION_CACHE_VERSION = 2
+HSN_EXTRACTION_CACHE_VERSION = 3
 HSN_MAX_GARBLED_WARNINGS = int(os.environ.get("HSN_MAX_GARBLED_WARNINGS", "20"))
 HSN_PDF_OCR_DPI = int(os.environ.get("HSN_PDF_OCR_DPI", "150"))
 HSN_PDF_OCR_MAX_PAGES = int(os.environ.get("HSN_PDF_OCR_MAX_PAGES", "128"))
@@ -223,19 +229,19 @@ def _extract_pdf_text_with_ocr(path: str, data: bytes, log: Callable[[str], None
         if page_text:
             chunks.append(page_text)
             total_chars += len(page_text)
-            if total_chars >= HSN_MAX_TEXT_CHARS:
+            if total_chars >= HSN_MAX_EXTRACTED_TEXT_CHARS:
                 break
 
     text = "\n".join(chunks).strip()
     if not text:
         log(f"  WARNING: PDF OCR produced empty/whitespace text for {path}")
-    return text[:HSN_MAX_TEXT_CHARS]
+    return text[:HSN_MAX_EXTRACTED_TEXT_CHARS]
 
 
 def _extract_text(path: str, data: bytes, converter: Any, log: Callable[[str], None]) -> str:
     ext = _extension(path)
     if ext in TEXT_EXTENSIONS:
-        return data.decode("utf-8", errors="ignore")[:HSN_MAX_TEXT_CHARS]
+        return data.decode("utf-8", errors="ignore")[:HSN_MAX_EXTRACTED_TEXT_CHARS]
     if ext == "pdf":
         return _extract_pdf_text_with_ocr(path, data, log)
 
@@ -245,11 +251,11 @@ def _extract_text(path: str, data: bytes, converter: Any, log: Callable[[str], N
         if not text:
             text = str(document) if document is not None else ""
         if text:
-            return text[:HSN_MAX_TEXT_CHARS]
+            return text[:HSN_MAX_EXTRACTED_TEXT_CHARS]
     except Exception:
         pass
 
-    return data.decode("latin-1", errors="ignore")[:HSN_MAX_TEXT_CHARS]
+    return data.decode("latin-1", errors="ignore")[:HSN_MAX_EXTRACTED_TEXT_CHARS]
 
 
 def _max_non_whitespace_run(text: str) -> int:
@@ -415,7 +421,7 @@ def _extract_embeddings(texts: list[str], log: Callable[[str], None]) -> np.ndar
 
 def _build_embedding_input(path: str, text: str) -> str:
     # Some embedding backends enforce a strict "less than N chars" limit.
-    max_total_chars = max(1, HSN_MAX_TEXT_CHARS - 1)
+    max_total_chars = max(1, HSN_MAX_EMBEDDING_TEXT_CHARS - 1)
     prefix = f"path: {path}\n"
     if len(prefix) >= max_total_chars:
         return prefix[:max_total_chars]
@@ -518,7 +524,7 @@ def _load_or_collect_documents(
     world_sha256 = _sha256_file(world_zip)
     cache_key = {
         "world_sha256": world_sha256,
-        "max_text_chars": HSN_MAX_TEXT_CHARS,
+        "max_extracted_text_chars": HSN_MAX_EXTRACTED_TEXT_CHARS,
         "max_files": HSN_MAX_FILES,
         "markitdown_version": _markitdown_version(),
         "pdf_extraction_method": "pdf2image+pytesseract",
@@ -666,7 +672,20 @@ def _build_hsn_index(
     graph = builder.build(embeddings, [doc["id"] for doc in docs])
     index = _graph_to_index(graph, docs)
     index["world_id"] = world_id
+    index["embedding_input_max_chars"] = HSN_MAX_EMBEDDING_TEXT_CHARS
+    index["embedding_extra_args"] = _load_embedding_extra_args()
     return index, embeddings, docs
+
+
+def _index_cache_compatible(index_data: dict[str, Any]) -> bool:
+    expected_extra_args = _load_embedding_extra_args()
+    if index_data.get("embedding_model") != HSN_EMBEDDING_MODEL:
+        return False
+    if index_data.get("embedding_input_max_chars") != HSN_MAX_EMBEDDING_TEXT_CHARS:
+        return False
+    if index_data.get("embedding_extra_args") != expected_extra_args:
+        return False
+    return True
 
 
 def _build_initial_message(index_data: dict[str, Any]) -> str:
@@ -755,7 +774,25 @@ def prepare_hsn_for_world(
     if index_path.exists():
         with open(index_path) as f:
             index_data = json.load(f)
-        log(f"  HSN cache hit: {index_path}")
+        if _index_cache_compatible(index_data):
+            log(f"  HSN cache hit: {index_path}")
+        else:
+            log("  HSN cache mismatch: rebuilding index for current embedding settings")
+            index_data, embeddings, docs = _build_hsn_index(world_id, world_zip, log)
+            with open(index_path, "w") as f:
+                json.dump(index_data, f, indent=2, sort_keys=True)
+            with open(docs_path, "w") as f:
+                json.dump(
+                    [
+                        {"id": doc["id"], "path": doc["path"], "size": doc["size"]}
+                        for doc in docs
+                    ],
+                    f,
+                    indent=2,
+                    sort_keys=True,
+                )
+            np.save(embeddings_path, embeddings)
+            log(f"  HSN index saved: {index_path}")
     else:
         log(f"  HSN cache miss: building index for {world_id} with {HSN_EMBEDDING_MODEL}")
         index_data, embeddings, docs = _build_hsn_index(world_id, world_zip, log)

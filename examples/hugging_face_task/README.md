@@ -160,7 +160,7 @@ In HSN mode:
 - The runner builds and caches per-world document embeddings and an HSN tree at `~/.cache/archipelago/hsn/<world_id>/<embedding_model>/hsn_index.json`
 - Document extraction output is cached per world at `~/.cache/archipelago/hsn/<world_id>/_extraction/documents_with_text.json.gz`
 - PDF extraction uses `pdf2image + pytesseract` OCR (MarkItDown is not used for PDFs)
-- Extraction cache is invalidated automatically when the world snapshot hash, extraction settings, or MarkItDown version changes
+- Extraction cache is invalidated automatically when the world snapshot hash, extraction settings (for example `HSN_MAX_EXTRACTED_TEXT_CHARS`), or MarkItDown version changes
 - Cached HSN artifacts are reused across future runs for that same world
 - A system message is injected before the user prompt, describing HSN semantics and listing top-level files with ID paths
 - `filesystem_server.list_files` annotates file entries with HSN paths and accepts file paths (returns top-10 HSN children)
@@ -200,6 +200,13 @@ Optional embedding timeout (seconds):
 
 ```bash
 HSN_EMBEDDING_TIMEOUT_SECONDS=180
+```
+
+Separate text limits for extraction vs embedding input:
+
+```bash
+HSN_MAX_EXTRACTED_TEXT_CHARS=131072
+HSN_MAX_EMBEDDING_TEXT_CHARS=131072
 ```
 
 Optional PDF OCR tuning:

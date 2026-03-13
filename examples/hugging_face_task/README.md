@@ -162,6 +162,7 @@ In HSN mode:
 - PDF extraction uses `pdf2image + pytesseract` OCR (MarkItDown is not used for PDFs)
 - Extraction cache is invalidated automatically when the world snapshot hash, extraction settings (for example `HSN_MAX_EXTRACTED_TEXT_CHARS`), or MarkItDown version changes
 - Cached HSN artifacts are reused across future runs for that same world
+- Embedding batches are cached incrementally; if a batch fails, the runner does binary search to isolate failing inputs, caches successful vectors, then aborts
 - A system message is injected before the user prompt, describing HSN semantics and listing top-level files with ID paths
 - `filesystem_server.list_files` annotates file entries with HSN paths and accepts file paths (returns top-10 HSN children)
 - `filesystem_server.search_files` also annotates matched files with HSN paths

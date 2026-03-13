@@ -368,7 +368,163 @@ def _collect_documents(world_zip: Path, log: Callable[[str], None]) -> list[dict
     return docs
 
 
-def _extract_embeddings(texts: list[str], log: Callable[[str], None]) -> np.ndarray:
+def _embedding_input_digest(texts: list[str]) -> str:
+    hasher = hashlib.sha256()
+    for text in texts:
+        hasher.update(text.encode("utf-8", errors="ignore"))
+        hasher.update(b"\x00")
+    return hasher.hexdigest()
+
+
+def _partial_embedding_cache_paths(cache_dir: Path) -> tuple[Path, Path, Path]:
+    meta_path = cache_dir / "embeddings_partial.meta.json"
+    indices_path = cache_dir / "embeddings_partial.indices.json"
+    vectors_path = cache_dir / "embeddings_partial.npy"
+    return meta_path, indices_path, vectors_path
+
+
+def _load_partial_embeddings(
+    cache_dir: Path,
+    cache_key: dict[str, Any],
+    log: Callable[[str], None],
+) -> dict[int, list[float]]:
+    meta_path, indices_path, vectors_path = _partial_embedding_cache_paths(cache_dir)
+    if not meta_path.exists() or not indices_path.exists() or not vectors_path.exists():
+        return {}
+
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if not isinstance(meta, dict):
+            return {}
+        if meta.get("version") != 1:
+            return {}
+        if meta.get("cache_key") != cache_key:
+            return {}
+
+        with open(indices_path) as f:
+            indices_raw = json.load(f)
+        if not isinstance(indices_raw, list):
+            return {}
+        indices = [int(v) for v in indices_raw]
+
+        vectors = np.load(vectors_path)
+        if vectors.ndim != 2 or vectors.shape[0] != len(indices):
+            return {}
+
+        out: dict[int, list[float]] = {}
+        for row, idx in enumerate(indices):
+            out[idx] = [float(v) for v in vectors[row].tolist()]
+        if out:
+            log(
+                f"  HSN: partial embedding cache hit ({len(out)} / {cache_key.get('input_count', '?')})"
+            )
+        return out
+    except Exception:
+        return {}
+
+
+def _save_partial_embeddings(
+    cache_dir: Path,
+    cache_key: dict[str, Any],
+    vectors_by_index: dict[int, list[float]],
+) -> None:
+    if not vectors_by_index:
+        return
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    sorted_indices = sorted(vectors_by_index)
+    matrix = np.array([vectors_by_index[idx] for idx in sorted_indices], dtype=np.float32)
+    meta_path, indices_path, vectors_path = _partial_embedding_cache_paths(cache_dir)
+
+    np.save(vectors_path, matrix)
+    with open(indices_path, "w") as f:
+        json.dump(sorted_indices, f)
+    with open(meta_path, "w") as f:
+        json.dump(
+            {
+                "version": 1,
+                "cache_key": cache_key,
+                "count": len(sorted_indices),
+                "created_at": int(time.time()),
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
+
+
+def _request_embeddings(
+    client: Any, batch: list[str], extra_args: dict[str, Any]
+) -> list[list[float]]:
+    payload: dict[str, Any] = {
+        "model": HSN_EMBEDDING_MODEL,
+        "input": batch,
+        **extra_args,
+    }
+    response = client.embeddings.create(**payload)
+    data = getattr(response, "data", None)
+    if not isinstance(data, list) or len(data) != len(batch):
+        raise RuntimeError("Unexpected embedding response shape from embedding endpoint")
+
+    vectors: list[list[float]] = []
+    for item in data:
+        embedding = getattr(item, "embedding", None)
+        if embedding is None and isinstance(item, dict):
+            embedding = item.get("embedding")
+        if not isinstance(embedding, list):
+            raise RuntimeError("Missing embedding vector in embedding response")
+        vectors.append([float(v) for v in embedding])
+    return vectors
+
+
+def _bisect_failed_embeddings(
+    *,
+    client: Any,
+    texts: list[str],
+    indices: list[int],
+    labels: list[str],
+    extra_args: dict[str, Any],
+    log: Callable[[str], None],
+) -> tuple[dict[int, list[float]], list[tuple[int, str]]]:
+    recovered: dict[int, list[float]] = {}
+    failures: list[tuple[int, str]] = []
+
+    def recurse(sub_indices: list[int]) -> None:
+        if not sub_indices:
+            return
+        sub_texts = [texts[idx] for idx in sub_indices]
+        try:
+            vectors = _request_embeddings(client, sub_texts, extra_args)
+            for idx, vector in zip(sub_indices, vectors):
+                recovered[idx] = vector
+            return
+        except Exception as exc:
+            if len(sub_indices) == 1:
+                idx = sub_indices[0]
+                label = labels[idx] if idx < len(labels) else f"index:{idx}"
+                err = str(exc)
+                log(
+                    "  HSN: isolated failing embedding input "
+                    f"idx={idx + 1}/{len(labels)} path={label} chars={len(texts[idx])} error={err}"
+                )
+                failures.append((idx, err))
+                return
+
+        mid = len(sub_indices) // 2
+        recurse(sub_indices[:mid])
+        recurse(sub_indices[mid:])
+
+    recurse(indices)
+    return recovered, failures
+
+
+def _extract_embeddings(
+    texts: list[str],
+    labels: list[str],
+    cache_dir: Path,
+    log: Callable[[str], None],
+) -> np.ndarray:
     if not texts:
         return np.zeros((0, 0), dtype=np.float32)
     if HSN_EMBEDDING_BATCH_SIZE <= 0:
@@ -381,9 +537,18 @@ def _extract_embeddings(texts: list[str], log: Callable[[str], None]) -> np.ndar
         ) from exc
 
     extra_args = _load_embedding_extra_args()
-    vectors: list[list[float]] = []
     total = len(texts)
     num_batches = (total + HSN_EMBEDDING_BATCH_SIZE - 1) // HSN_EMBEDDING_BATCH_SIZE
+    cache_key = {
+        "model": HSN_EMBEDDING_MODEL,
+        "base_url": HSN_EMBEDDING_BASE_URL,
+        "embedding_input_max_chars": HSN_MAX_EMBEDDING_TEXT_CHARS,
+        "extra_args": extra_args,
+        "input_digest": _embedding_input_digest(texts),
+        "input_count": total,
+    }
+    vectors_by_index = _load_partial_embeddings(cache_dir, cache_key, log)
+
     client = OpenAI(
         api_key=HSN_EMBEDDING_API_KEY,
         base_url=HSN_EMBEDDING_BASE_URL,
@@ -392,31 +557,64 @@ def _extract_embeddings(texts: list[str], log: Callable[[str], None]) -> np.ndar
 
     for batch_idx, start in enumerate(range(0, total, HSN_EMBEDDING_BATCH_SIZE), start=1):
         end = min(total, start + HSN_EMBEDDING_BATCH_SIZE)
-        batch = texts[start:end]
+        batch_indices = list(range(start, end))
+        missing_indices = [idx for idx in batch_indices if idx not in vectors_by_index]
+        if not missing_indices:
+            log(
+                f"  HSN: embedding batch {batch_idx}/{num_batches} "
+                f"({start + 1}-{end}/{total}) skipped (cache hit)"
+            )
+            continue
+
+        batch = [texts[idx] for idx in missing_indices]
         log(f"  HSN: embedding batch {batch_idx}/{num_batches} ({start + 1}-{end}/{total})")
-        payload: dict[str, Any] = {
-            "model": HSN_EMBEDDING_MODEL,
-            "input": batch,
-            **extra_args,
-        }
+
         try:
-            response = client.embeddings.create(**payload)
+            batch_vectors = _request_embeddings(client, batch, extra_args)
         except Exception as exc:
-            raise RuntimeError(f"Embedding request failed: {exc}") from exc
+            log(
+                "  WARNING: embedding batch request failed; "
+                "running binary search to isolate failing input(s)"
+            )
+            recovered, failures = _bisect_failed_embeddings(
+                client=client,
+                texts=texts,
+                indices=missing_indices,
+                labels=labels,
+                extra_args=extra_args,
+                log=log,
+            )
+            vectors_by_index.update(recovered)
+            _save_partial_embeddings(cache_dir, cache_key, vectors_by_index)
 
-        data = getattr(response, "data", None)
-        if not isinstance(data, list) or len(data) != len(batch):
-            raise RuntimeError("Unexpected embedding response shape from embedding endpoint")
+            if failures:
+                details: list[str] = []
+                for idx, err in failures:
+                    label = labels[idx] if idx < len(labels) else f"index:{idx}"
+                    details.append(
+                        f"idx={idx + 1}/{total} path={label} chars={len(texts[idx])} error={err}"
+                    )
+                raise RuntimeError(
+                    "Embedding failures detected after binary search; aborting run.\n"
+                    + "\n".join(details)
+                ) from exc
+            raise RuntimeError(
+                "Embedding batch failed but binary search did not isolate failing inputs; aborting run."
+            ) from exc
 
-        for item in data:
-            embedding = getattr(item, "embedding", None)
-            if embedding is None and isinstance(item, dict):
-                embedding = item.get("embedding")
-            if not isinstance(embedding, list):
-                raise RuntimeError("Missing embedding vector in embedding response")
-            vectors.append([float(v) for v in embedding])
+        for idx, vector in zip(missing_indices, batch_vectors):
+            vectors_by_index[idx] = vector
+        _save_partial_embeddings(cache_dir, cache_key, vectors_by_index)
 
-    return np.array(vectors, dtype=np.float32)
+    missing = [idx for idx in range(total) if idx not in vectors_by_index]
+    if missing:
+        raise RuntimeError(
+            "Embedding run incomplete: missing vectors for indices "
+            + ", ".join(str(idx + 1) for idx in missing[:20])
+        )
+
+    ordered_vectors = [vectors_by_index[idx] for idx in range(total)]
+    return np.array(ordered_vectors, dtype=np.float32)
 
 
 def _build_embedding_input(path: str, text: str) -> str:
@@ -639,7 +837,7 @@ def _graph_to_index(graph: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _build_hsn_index(
-    world_id: str, world_zip: Path, log: Callable[[str], None]
+    world_id: str, world_zip: Path, cache_dir: Path, log: Callable[[str], None]
 ) -> tuple[dict[str, Any], np.ndarray, list[dict[str, Any]]]:
     collect_started = time.time()
     docs = _load_or_collect_documents(world_id, world_zip, log)
@@ -666,7 +864,12 @@ def _build_hsn_index(
 
     embed_inputs = [_build_embedding_input(doc["path"], doc["text"]) for doc in docs]
     embed_started = time.time()
-    embeddings = _extract_embeddings(embed_inputs, log)
+    embeddings = _extract_embeddings(
+        texts=embed_inputs,
+        labels=[doc["path"] for doc in docs],
+        cache_dir=cache_dir,
+        log=log,
+    )
     log(f"  HSN: embedding completed in {time.time() - embed_started:.1f}s")
     builder = _build_hsn_builder()
     graph = builder.build(embeddings, [doc["id"] for doc in docs])
@@ -778,7 +981,9 @@ def prepare_hsn_for_world(
             log(f"  HSN cache hit: {index_path}")
         else:
             log("  HSN cache mismatch: rebuilding index for current embedding settings")
-            index_data, embeddings, docs = _build_hsn_index(world_id, world_zip, log)
+            index_data, embeddings, docs = _build_hsn_index(
+                world_id, world_zip, cache_dir, log
+            )
             with open(index_path, "w") as f:
                 json.dump(index_data, f, indent=2, sort_keys=True)
             with open(docs_path, "w") as f:
@@ -795,7 +1000,7 @@ def prepare_hsn_for_world(
             log(f"  HSN index saved: {index_path}")
     else:
         log(f"  HSN cache miss: building index for {world_id} with {HSN_EMBEDDING_MODEL}")
-        index_data, embeddings, docs = _build_hsn_index(world_id, world_zip, log)
+        index_data, embeddings, docs = _build_hsn_index(world_id, world_zip, cache_dir, log)
         with open(index_path, "w") as f:
             json.dump(index_data, f, indent=2, sort_keys=True)
         # Persist source docs and embeddings so we never recompute for same world/model.

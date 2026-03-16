@@ -66,6 +66,31 @@ Results are saved to `output/<task_id>/`:
 | `agent_config.json` | Agent configuration used |
 | `verifiers.json` | Grading criteria (from HuggingFace rubric) |
 
+## Comparing Paired Runs
+
+To compare two output directories (paired by task id) on assistant message counts and final score:
+
+```bash
+python examples/hugging_face_task/compare_paired_runs.py \
+  --run-a output/baseline50 \
+  --run-b output/hsn_6db455f60dd0a4583abcec9e206aa23508572127
+```
+
+Optional flags:
+
+```bash
+python examples/hugging_face_task/compare_paired_runs.py \
+  --run-a output/baseline50 \
+  --run-b output/hsn_6db455f60dd0a4583abcec9e206aa23508572127 \
+  --label-a baseline \
+  --label-b hsn \
+  --assistant-mode content \
+  --json /tmp/paired_summary.json \
+  --csv /tmp/paired_pairs.csv
+```
+
+`--assistant-mode content` only counts assistant messages with non-empty content. The default (`all`) includes tool-call messages.
+
 ## How It Works
 
 Unlike `simple_task` which uses static pre-defined files, this example dynamically fetches everything from HuggingFace:

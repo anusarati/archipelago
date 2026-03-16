@@ -4,9 +4,30 @@ from typing import Annotated
 
 from pydantic import Field
 from utils.decorators import make_async_background
-from utils.hsn import annotate_path, hsn_children, hsn_mode_enabled, render_id_map
+from utils.hsn import (
+    FS_HSN_ENABLED,
+    annotate_path,
+    hsn_children,
+    hsn_mode_enabled,
+    render_id_map,
+)
 
 FS_ROOT = os.getenv("APP_FS_ROOT", "/filesystem")
+_LIST_FILES_DESCRIPTION = (
+    "Absolute path within the sandbox filesystem to list. Must start with '/'. This is "
+    "NOT a system path - '/' refers to the sandbox root. Default: '/' (sandbox root). "
+    "Example: '/documents' or '/data/uploads'. Returns a newline-separated string where "
+    "each line describes one entry: \"'name' (folder)\\n\" for directories, "
+    "\"'name' (mime/type file) N bytes\\n\" for files. MIME type is guessed from "
+    "extension ('unknown' if undetectable). Returns '[not found: path]', "
+    "'[permission denied: path]', or '[not a directory: path]' for errors. Returns "
+    "'No items found' for empty directories."
+)
+if FS_HSN_ENABLED:
+    _LIST_FILES_DESCRIPTION += (
+        " In HSN mode, passing a file path returns the file's top-10 HSN children (if "
+        "any) plus an HSN id map."
+    )
 
 
 def _resolve_under_root(p: str | None) -> str:
@@ -33,7 +54,7 @@ def list_files(
     path: Annotated[
         str,
         Field(
-            description="Absolute path within the sandbox filesystem to list. Must start with '/'. This is NOT a system path - '/' refers to the sandbox root. Default: '/' (sandbox root). Example: '/documents' or '/data/uploads'. Returns a newline-separated string where each line describes one entry: \"'name' (folder)\\n\" for directories, \"'name' (mime/type file) N bytes\\n\" for files. MIME type is guessed from extension ('unknown' if undetectable). Returns '[not found: path]', '[permission denied: path]', or '[not a directory: path]' for errors. Returns 'No items found' for empty directories."
+            description=_LIST_FILES_DESCRIPTION
         ),
     ] = "/",
 ) -> str:

@@ -911,20 +911,27 @@ def _build_initial_message(index_data: dict[str, Any]) -> str:
         "Each file can be referenced by an HSN path represented as a list of integer file IDs from a top-level root file to a descendant file.",
         "Along a path, files are ordered from most central to least central, each branch is a semantic cluster, and a node is semantically closer to its parent than to higher predecessors.",
         "",
-        "Top-level files by subtree size (top 10):",
+        "Expanded HSN nodes:",
     ]
 
     used_ids: set[int] = set()
-    top_roots = roots[:10]
-    for i, node_id in enumerate(top_roots, start=1):
-        key = str(node_id)
-        path_ids = paths.get(key, [node_id])
-        if not isinstance(path_ids, list):
-            path_ids = [node_id]
-        cleaned_ids = [int(v) for v in path_ids]
-        used_ids.update(cleaned_ids)
+    import sys
+    from pathlib import Path
+    ARCHIPELAGO_DIR = Path(__file__).resolve().parents[2]
+    FS_SERVER_DIR = ARCHIPELAGO_DIR / "mcp_servers" / "filesystem"
+    if str(FS_SERVER_DIR) not in sys.path:
+        sys.path.insert(0, str(FS_SERVER_DIR))
+    from mcp_servers.filesystem_server.utils.hsn import expand_hsn_nodes
+    top_roots = expand_hsn_nodes(roots)
+    # Convert back to list of node IDs for clean processing or just items
+    node_ids_to_process = []
+    for path, path_ids in top_roots:
+        node_ids_to_process.append(path_ids[-1])
+        used_ids.update(path_ids)
+        
+    for i, (child_path, child_ids) in enumerate(top_roots, start=1):
         lines.append(
-            f"{i}. {id_to_path.get(key, f'<missing:{node_id}>')} | HSN path: {cleaned_ids} | subtree_size={subtree.get(key, 1)}"
+            f"{i}. {child_path} | HSN path: {child_ids}"
         )
 
     if not top_roots:

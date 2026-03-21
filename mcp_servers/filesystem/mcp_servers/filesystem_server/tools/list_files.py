@@ -69,7 +69,8 @@ def list_files(
             file_rel = _to_relative_path(base)
             file_annotation, file_ids = annotate_path(file_rel)
             ids_used = set(file_ids)
-            children = hsn_children(file_rel, limit=10)
+            from utils.hsn import expand_hsn_nodes
+            children = expand_hsn_nodes([file_ids[-1]])
             if not children:
                 lines = [
                     f"'{file_rel}' is a file {file_annotation}",
@@ -131,6 +132,12 @@ def list_files(
             items = f"No items found in '{path}'"
 
     if items and hsn_enabled and ids_used:
+        from utils.hsn import expand_hsn_nodes
+        expanded = expand_hsn_nodes(list(ids_used))
+        if expanded:
+            items += "\nExpanded HSN nodes:\n"
+            for child_path, child_ids in expanded:
+                items += f"- {child_path} [HSN: {child_ids}]\n"
         id_map = render_id_map(ids_used)
         if id_map:
             items += f"\nHSN id map:\n{id_map}\n"

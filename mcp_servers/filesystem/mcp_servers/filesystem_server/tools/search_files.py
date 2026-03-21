@@ -168,6 +168,12 @@ def search_files(
             ids_used.update(ids)
             annotated_lines.append(f"{match_path} {annotation}")
         result += "\n".join(annotated_lines)
+        from utils.hsn import expand_hsn_nodes
+        expanded = expand_hsn_nodes(list(ids_used))
+        if expanded:
+            result += "\n\nExpanded HSN nodes:\n"
+            for child_path, child_ids in expanded:
+                result += f"- {child_path} [HSN: {child_ids}]\n"
         id_map = render_id_map(ids_used)
         if id_map:
             result += f"\n\nHSN id map:\n{id_map}"

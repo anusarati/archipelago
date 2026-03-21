@@ -168,3 +168,85 @@ def render_id_map(ids: set[int]) -> str:
         for node_id in sorted(ids)
     }
     return json.dumps(mapping, indent=2, sort_keys=True)
+
+
+def expand_hsn_nodes(start_ids: list[int], limit: int | None = None) -> list[tuple[str, list[int]]]:
+    if limit is None:
+        limit = int(os.getenv("FS_HSN_EXPAND_LIMIT", "30"))
+        
+    data = _read_index()
+    if data is None:
+        return []
+
+    children_map = data.get("children", {})
+    subtree_size_map = data.get("subtree_size", {})
+    paths_map = data.get("paths", {})
+    id_to_path = data.get("id_to_path", {})
+
+    if (
+        not isinstance(children_map, dict)
+        or not isinstance(subtree_size_map, dict)
+        or not isinstance(paths_map, dict)
+        or not isinstance(id_to_path, dict)
+    ):
+        return []
+
+    visible_nodes = list(start_ids)
+    expanded_counts = {str(node_id): 0 for node_id in start_ids}
+
+    candidates = set()
+    for node_id in start_ids:
+        key = str(node_id)
+        if children_map.get(key):
+            candidates.add(key)
+
+    while len(visible_nodes) < limit and candidates:
+        def sort_key(node_id_str):
+            node_path = paths_map.get(node_id_str, [])
+            depth = len(node_path) - 1 if isinstance(node_path, list) else 0
+            descendants = subtree_size_map.get(node_id_str, 1)
+            return (depth, -descendants)
+
+        best_node_str = min(candidates, key=sort_key)
+
+        children = children_map.get(best_node_str, [])
+        offset = expanded_counts.get(best_node_str, 0)
+        to_add = children[offset : offset + 3]
+        expanded_counts[best_node_str] = offset + len(to_add)
+
+        for ans_raw in to_add:
+            try:
+                ans = int(ans_raw)
+            except Exception:
+                continue
+            if ans not in visible_nodes:
+                visible_nodes.append(ans)
+                ans_str = str(ans)
+                if children_map.get(ans_str):
+                    candidates.add(ans_str)
+                    expanded_counts[ans_str] = 0
+
+        if expanded_counts[best_node_str] >= len(children):
+            candidates.remove(best_node_str)
+
+    output: list[tuple[str, list[int]]] = []
+    for node_id in visible_nodes:
+        node_str = str(node_id)
+        child_path = id_to_path.get(node_str, f"<missing:{node_id}>")
+        # Ensure it is a string for printing
+        child_path = str(child_path)
+
+        raw_path_ids = paths_map.get(node_str, [node_id])
+        path_ids: list[int] = []
+        if isinstance(raw_path_ids, list):
+            for value in raw_path_ids:
+                try:
+                    path_ids.append(int(value))
+                except Exception:
+                    continue
+        if not path_ids:
+            path_ids = [node_id]
+
+        output.append((_normalize_path(child_path), path_ids))
+        
+    return output

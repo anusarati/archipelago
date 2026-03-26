@@ -184,7 +184,13 @@ def _format_float(value: float | None) -> str:
     return f"{value:.4f}"
 
 
-def _summary_stats(values: np.ndarray) -> dict[str, float]:
+def _summary_stats(values: np.ndarray) -> dict[str, Any]:
+    skewness = None
+    if stats is not None and values.size > 2:
+        try:
+            skewness = float(stats.skew(values))
+        except Exception:
+            pass
     return {
         "n": int(values.size),
         "mean": float(np.mean(values)),
@@ -193,10 +199,11 @@ def _summary_stats(values: np.ndarray) -> dict[str, float]:
         "min": float(np.min(values)),
         "max": float(np.max(values)),
         "iqr": float(np.percentile(values, 75) - np.percentile(values, 25)),
+        "skewness": skewness,
     }
 
 
-def _paired_test(diff: np.ndarray, alpha: float) -> dict[str, Any]:
+def _paired_test(a_vals: np.ndarray, b_vals: np.ndarray, diff: np.ndarray, alpha: float) -> dict[str, Any]:
     if stats is None:
         return {"test": "unavailable", "reason": "scipy_not_installed"}
     if diff.size < 3:
@@ -213,13 +220,14 @@ def _paired_test(diff: np.ndarray, alpha: float) -> dict[str, Any]:
         except Exception:
             use_ttest = False
 
+    ret: dict[str, Any] = {}
     if use_ttest:
         result = stats.ttest_rel(diff, np.zeros_like(diff))
         t_stat = float(result.statistic)
         p_value = float(result.pvalue)
         sd = float(np.std(diff, ddof=1))
         cohen_d = float(np.mean(diff) / sd) if sd else None
-        return {
+        ret = {
             "test": "paired_t",
             "statistic": t_stat,
             "p_value": p_value,
@@ -227,28 +235,56 @@ def _paired_test(diff: np.ndarray, alpha: float) -> dict[str, Any]:
             "effect_size_label": "cohen_d",
             "normality_p": normality_p,
         }
+    else:
+        try:
+            result = stats.wilcoxon(diff, zero_method="pratt", alternative="two-sided")
+            w_stat = float(result.statistic)
+            p_value = float(result.pvalue)
+            if p_value > 0:
+                z_score = float(stats.norm.isf(p_value / 2))
+                r = z_score / math.sqrt(diff.size)
+                if float(np.median(diff)) < 0:
+                    r = -r
+            else:
+                r = None
+            ret = {
+                "test": "wilcoxon_signed_rank",
+                "statistic": w_stat,
+                "p_value": p_value,
+                "effect_size": r,
+                "effect_size_label": "r",
+                "normality_p": normality_p,
+            }
+        except Exception as exc:
+            ret = {"test": "unavailable", "reason": f"wilcoxon_error:{exc}", "normality_p": normality_p}
+
+    pos = int(np.sum(diff > 0))
+    neg = int(np.sum(diff < 0))
+    if pos + neg > 0:
+        try:
+            if hasattr(stats, 'binomtest'):
+                ret["sign_p"] = float(stats.binomtest(min(pos, neg), pos + neg, 0.5).pvalue)
+            else:
+                ret["sign_p"] = float(stats.binom_test(min(pos, neg), pos + neg, 0.5))
+        except Exception:
+            pass
 
     try:
-        result = stats.wilcoxon(diff, zero_method="pratt", alternative="two-sided")
-        w_stat = float(result.statistic)
-        p_value = float(result.pvalue)
-        if p_value > 0:
-            z_score = float(stats.norm.isf(p_value / 2))
-            r = z_score / math.sqrt(diff.size)
-            if float(np.median(diff)) < 0:
-                r = -r
-        else:
-            r = None
-        return {
-            "test": "wilcoxon_signed_rank",
-            "statistic": w_stat,
-            "p_value": p_value,
-            "effect_size": r,
-            "effect_size_label": "r",
-            "normality_p": normality_p,
-        }
-    except Exception as exc:
-        return {"test": "unavailable", "reason": f"wilcoxon_error:{exc}"}
+        ks_res = stats.ks_2samp(a_vals, b_vals)
+        ret["ks_stat"] = float(ks_res.statistic)
+        ret["ks_p"] = float(ks_res.pvalue)
+    except Exception:
+        pass
+
+    try:
+        # anderson_ksamp might raise error on many ties or exact matches, so it uses try-except
+        ad_res = stats.anderson_ksamp([a_vals, b_vals])
+        ret["ad_stat"] = float(ad_res.statistic)
+        ret["ad_p"] = float(getattr(ad_res, 'pvalue', getattr(ad_res, 'significance_level', None)))
+    except Exception:
+        pass
+
+    return ret
 
 
 def _render_metric(
@@ -271,7 +307,7 @@ def _render_metric(
     stats_a = _summary_stats(a_vals)
     stats_b = _summary_stats(b_vals)
     stats_diff = _summary_stats(diff)
-    test_result = _paired_test(diff, alpha)
+    test_result = _paired_test(a_vals, b_vals, diff, alpha)
 
     lines = [
         f"{metric.name}: paired samples = {stats_diff['n']}",
@@ -279,17 +315,20 @@ def _render_metric(
         f"median={_format_float(stats_a['median'])} "
         f"std={_format_float(stats_a['std'])} "
         f"min={_format_float(stats_a['min'])} "
-        f"max={_format_float(stats_a['max'])}",
+        f"max={_format_float(stats_a['max'])} "
+        f"skewness={_format_float(stats_a.get('skewness'))}",
         f"{label_b}: mean={_format_float(stats_b['mean'])} "
         f"median={_format_float(stats_b['median'])} "
         f"std={_format_float(stats_b['std'])} "
         f"min={_format_float(stats_b['min'])} "
-        f"max={_format_float(stats_b['max'])}",
+        f"max={_format_float(stats_b['max'])} "
+        f"skewness={_format_float(stats_b.get('skewness'))}",
         f"diff (B-A): mean={_format_float(stats_diff['mean'])} "
         f"median={_format_float(stats_diff['median'])} "
         f"std={_format_float(stats_diff['std'])} "
         f"min={_format_float(stats_diff['min'])} "
-        f"max={_format_float(stats_diff['max'])}",
+        f"max={_format_float(stats_diff['max'])} "
+        f"skewness={_format_float(stats_diff.get('skewness'))}",
     ]
 
     if test_result.get("test") == "paired_t":
@@ -309,6 +348,23 @@ def _render_metric(
     else:
         lines.append(
             f"test: unavailable ({test_result.get('reason','unknown')})"
+        )
+
+    if test_result.get("sign_p") is not None:
+        lines.append(f"test: Sign Test, p={_format_float(test_result.get('sign_p'))}")
+
+    if test_result.get("ks_p") is not None:
+        lines.append(
+            "test: Two-sample KS, "
+            f"statistic={_format_float(test_result.get('ks_stat'))}, "
+            f"p={_format_float(test_result.get('ks_p'))}"
+        )
+
+    if test_result.get("ad_p") is not None:
+        lines.append(
+            "test: Two-sample Anderson-Darling, "
+            f"statistic={_format_float(test_result.get('ad_stat'))}, "
+            f"p={_format_float(test_result.get('ad_p'))}"
         )
 
     if test_result.get("normality_p") is not None:

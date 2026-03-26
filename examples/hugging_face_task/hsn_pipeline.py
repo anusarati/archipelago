@@ -891,6 +891,85 @@ def _index_cache_compatible(index_data: dict[str, Any]) -> bool:
     return True
 
 
+def _expand_hsn_nodes_from_data(
+    index_data: dict[str, Any],
+    start_ids: list[int],
+    limit: int = 30,
+) -> list[tuple[str, list[int]]]:
+    """Expand HSN nodes directly from index_data without reading from disk."""
+    children_map = index_data.get("children", {})
+    subtree_size_map = index_data.get("subtree_size", {})
+    paths_map = index_data.get("paths", {})
+    id_to_path = index_data.get("id_to_path", {})
+
+    if (
+        not isinstance(children_map, dict)
+        or not isinstance(subtree_size_map, dict)
+        or not isinstance(paths_map, dict)
+        or not isinstance(id_to_path, dict)
+    ):
+        return []
+
+    visible_nodes = list(start_ids)
+    expanded_counts = {str(node_id): 0 for node_id in start_ids}
+
+    candidates = set()
+    for node_id in start_ids:
+        key = str(node_id)
+        if children_map.get(key):
+            candidates.add(key)
+
+    while len(visible_nodes) < limit and candidates:
+        def sort_key(node_id_str: str) -> tuple[int, int]:
+            node_path = paths_map.get(node_id_str, [])
+            depth = len(node_path) - 1 if isinstance(node_path, list) else 0
+            descendants = subtree_size_map.get(node_id_str, 1)
+            return (depth, -descendants)
+
+        best_node_str = min(candidates, key=sort_key)
+
+        children = children_map.get(best_node_str, [])
+        offset = expanded_counts.get(best_node_str, 0)
+        to_add = children[offset : offset + 3]
+        expanded_counts[best_node_str] = offset + len(to_add)
+
+        for ans_raw in to_add:
+            try:
+                ans = int(ans_raw)
+            except Exception:
+                continue
+            if ans not in visible_nodes:
+                visible_nodes.append(ans)
+                ans_str = str(ans)
+                if children_map.get(ans_str):
+                    candidates.add(ans_str)
+                    expanded_counts[ans_str] = 0
+
+        if expanded_counts[best_node_str] >= len(children):
+            candidates.remove(best_node_str)
+
+    output: list[tuple[str, list[int]]] = []
+    for node_id in visible_nodes:
+        node_str = str(node_id)
+        child_path = id_to_path.get(node_str, f"<missing:{node_id}>")
+        child_path = str(child_path)
+
+        raw_path_ids = paths_map.get(node_str, [node_id])
+        path_ids: list[int] = []
+        if isinstance(raw_path_ids, list):
+            for value in raw_path_ids:
+                try:
+                    path_ids.append(int(value))
+                except Exception:
+                    continue
+        if not path_ids:
+            path_ids = [node_id]
+
+        output.append((_normalize_path(child_path), path_ids))
+
+    return output
+
+
 def _build_initial_message(index_data: dict[str, Any]) -> str:
     roots = index_data.get("roots", [])
     id_to_path = index_data.get("id_to_path", {})
@@ -915,20 +994,10 @@ def _build_initial_message(index_data: dict[str, Any]) -> str:
     ]
 
     used_ids: set[int] = set()
-    import sys
-    from pathlib import Path
-    ARCHIPELAGO_DIR = Path(__file__).resolve().parents[2]
-    FS_SERVER_DIR = ARCHIPELAGO_DIR / "mcp_servers" / "filesystem"
-    if str(FS_SERVER_DIR) not in sys.path:
-        sys.path.insert(0, str(FS_SERVER_DIR))
-    from mcp_servers.filesystem_server.utils.hsn import expand_hsn_nodes
-    top_roots = expand_hsn_nodes(roots)
-    # Convert back to list of node IDs for clean processing or just items
-    node_ids_to_process = []
+    top_roots = _expand_hsn_nodes_from_data(index_data, roots)
     for path, path_ids in top_roots:
-        node_ids_to_process.append(path_ids[-1])
         used_ids.update(path_ids)
-        
+
     for i, (child_path, child_ids) in enumerate(top_roots, start=1):
         lines.append(
             f"{i}. {child_path} | HSN path: {child_ids}"

@@ -223,13 +223,14 @@ def _should_retry_task_on_resume(entry: dict[str, object] | None) -> bool:
 
     return_code = entry.get("return_code")
     status = entry.get("agent_status")
+    grading_status = entry.get("grading_status")
 
     # Environment/bootstrap failure while configuring MCP servers.
     if return_code == INFRA_FAILURE_EXIT_CODE:
         return True
 
     # Transient/system errors (e.g., API rate limits/timeouts/provider issues).
-    if status == "error":
+    if status == "error" or grading_status == "error":
         return True
 
     # User interruptions, cancellations, or missing/unknown status should rerun.
@@ -381,6 +382,7 @@ def main():
 
                 task_output_dir = EXAMPLE_DIR / "output" / task_id
                 trajectory_status = None
+                grading_status = None
                 final_score = None
 
                 trajectory_file = task_output_dir / "trajectory.json"
@@ -394,6 +396,7 @@ def main():
                     with open(grades_file) as f:
                         grades = json.load(f)
                     final_score = grades.get("scoring_results", {}).get("final_score")
+                    grading_status = grades.get("grading_run_status")
 
                 summary_by_task[task_id] = {
                     "task_id": task_id,
@@ -401,6 +404,7 @@ def main():
                     "world_id": world_id,
                     "return_code": result.returncode,
                     "agent_status": trajectory_status,
+                    "grading_status": grading_status,
                     "final_score": final_score,
                 }
 
@@ -439,6 +443,7 @@ def main():
                         "world_id": world_id,
                         "return_code": 130,
                         "agent_status": "interrupted",
+                        "grading_status": None,
                         "final_score": None,
                     },
                 )

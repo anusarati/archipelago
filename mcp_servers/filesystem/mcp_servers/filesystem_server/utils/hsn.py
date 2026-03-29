@@ -170,10 +170,126 @@ def render_id_map(ids: set[int]) -> str:
     return json.dumps(mapping, indent=2, sort_keys=True)
 
 
-def expand_hsn_nodes(start_ids: list[int], limit: int | None = None) -> list[tuple[str, list[int]]]:
+def _expand_hsn_nodes_impl(
+    children_map: dict,
+    subtree_size_map: dict,
+    paths_map: dict,
+    id_to_path: dict,
+    start_ids: list[int],
+    limit: int,
+) -> list[dict]:
+    """Core expansion logic shared by expand_hsn_nodes and hsn_pipeline.
+
+    Returns a list of dicts:
+        {
+            "node_id": int,
+            "path": str,           # filesystem path
+            "parent_id": int|None, # HSN parent node id (None for roots/start_ids)
+            "depth": int,          # depth in the visible tree (0 for start_ids)
+            "listed_children": int, # number of children listed in output
+            "total_children": int,  # total number of children
+        }
+    """
+    # Map each node to its parent among the start_ids / expanded set
+    parent_in_tree: dict[int, int | None] = {nid: None for nid in start_ids}
+    visible_nodes = list(start_ids)
+    # Track how many times each node has been expanded (0 = never)
+    expanded_counts: dict[str, int] = {str(nid): 0 for nid in start_ids}
+    # Track relative depth from start_ids (all start at 0)
+    depth_map: dict[str, int] = {str(nid): 0 for nid in start_ids}
+
+    # Candidates: nodes with children that are not yet fully expanded
+    candidates = set()
+    for node_id in start_ids:
+        key = str(node_id)
+        if children_map.get(key):
+            candidates.add(key)
+
+    while len(visible_nodes) < limit and candidates:
+        def sort_key(node_id_str: str) -> tuple[int, int, int]:
+            count = expanded_counts.get(node_id_str, 0)
+            depth = depth_map.get(node_id_str, 0)
+            descendants = subtree_size_map.get(node_id_str, 1)
+            return (count, depth, -descendants)
+
+        best_node_str = min(candidates, key=sort_key)
+
+        children = children_map.get(best_node_str, [])
+        count = expanded_counts.get(best_node_str, 0)
+        offset = count * 3
+        to_add = children[offset : offset + 3]
+        expanded_counts[best_node_str] = count + 1
+
+        # Remove from candidates if fully expanded
+        if offset + 3 >= len(children):
+            candidates.discard(best_node_str)
+
+        parent_id = int(best_node_str)
+        child_depth = depth_map.get(best_node_str, 0) + 1
+        for ans_raw in to_add:
+            try:
+                ans = int(ans_raw)
+            except Exception:
+                continue
+            if ans not in parent_in_tree:
+                visible_nodes.append(ans)
+                parent_in_tree[ans] = parent_id
+                ans_str = str(ans)
+                expanded_counts[ans_str] = 0
+                depth_map[ans_str] = child_depth
+                if children_map.get(ans_str):
+                    candidates.add(ans_str)
+
+    # Count how many children of each visible node are also visible
+    listed_children_count: dict[int, int] = {nid: 0 for nid in visible_nodes}
+    for nid in visible_nodes:
+        pid = parent_in_tree.get(nid)
+        if pid is not None and pid in listed_children_count:
+            listed_children_count[pid] += 1
+
+    output: list[dict] = []
+    for node_id in visible_nodes:
+        node_str = str(node_id)
+        child_path = id_to_path.get(node_str, f"<missing:{node_id}>")
+        child_path = str(child_path)
+        total_children = len(children_map.get(node_str, []))
+        listed = listed_children_count.get(node_id, 0)
+
+        output.append({
+            "node_id": node_id,
+            "path": _normalize_path(child_path),
+            "parent_id": parent_in_tree.get(node_id),
+            "depth": depth_map.get(node_str, 0),
+            "listed_children": listed,
+            "total_children": total_children,
+        })
+
+    return output
+
+
+def render_hsn_tree(nodes: list[dict]) -> str:
+    """Render expanded HSN nodes as an indented tree.
+
+    Each line: ``<indent><path> (<listed>/<total> children)``
+    where indentation reflects parent-child depth.
+    """
+    lines: list[str] = []
+    for node in nodes:
+        indent = "  " * node["depth"]
+        ratio = f"({node['listed_children']}/{node['total_children']} children)"
+        lines.append(f"{indent}{node['path']} {ratio}")
+    return "\n".join(lines)
+
+
+def expand_hsn_nodes(start_ids: list[int], limit: int | None = None) -> list[dict]:
+    """Expand HSN nodes from the on-disk index.
+
+    Returns a list of dicts with keys:
+        node_id, path, parent_id, depth, listed_children, total_children
+    """
     if limit is None:
         limit = int(os.getenv("FS_HSN_EXPAND_LIMIT", "30"))
-        
+
     data = _read_index()
     if data is None:
         return []
@@ -191,62 +307,7 @@ def expand_hsn_nodes(start_ids: list[int], limit: int | None = None) -> list[tup
     ):
         return []
 
-    visible_nodes = list(start_ids)
-    expanded_counts = {str(node_id): 0 for node_id in start_ids}
-
-    candidates = set()
-    for node_id in start_ids:
-        key = str(node_id)
-        if children_map.get(key):
-            candidates.add(key)
-
-    while len(visible_nodes) < limit and candidates:
-        def sort_key(node_id_str):
-            node_path = paths_map.get(node_id_str, [])
-            depth = len(node_path) - 1 if isinstance(node_path, list) else 0
-            descendants = subtree_size_map.get(node_id_str, 1)
-            return (depth, -descendants)
-
-        best_node_str = min(candidates, key=sort_key)
-
-        children = children_map.get(best_node_str, [])
-        offset = expanded_counts.get(best_node_str, 0)
-        to_add = children[offset : offset + 3]
-        expanded_counts[best_node_str] = offset + len(to_add)
-
-        for ans_raw in to_add:
-            try:
-                ans = int(ans_raw)
-            except Exception:
-                continue
-            if ans not in visible_nodes:
-                visible_nodes.append(ans)
-                ans_str = str(ans)
-                if children_map.get(ans_str):
-                    candidates.add(ans_str)
-                    expanded_counts[ans_str] = 0
-
-        if expanded_counts[best_node_str] >= len(children):
-            candidates.remove(best_node_str)
-
-    output: list[tuple[str, list[int]]] = []
-    for node_id in visible_nodes:
-        node_str = str(node_id)
-        child_path = id_to_path.get(node_str, f"<missing:{node_id}>")
-        # Ensure it is a string for printing
-        child_path = str(child_path)
-
-        raw_path_ids = paths_map.get(node_str, [node_id])
-        path_ids: list[int] = []
-        if isinstance(raw_path_ids, list):
-            for value in raw_path_ids:
-                try:
-                    path_ids.append(int(value))
-                except Exception:
-                    continue
-        if not path_ids:
-            path_ids = [node_id]
-
-        output.append((_normalize_path(child_path), path_ids))
-        
-    return output
+    return _expand_hsn_nodes_impl(
+        children_map, subtree_size_map, paths_map, id_to_path,
+        start_ids, limit,
+    )

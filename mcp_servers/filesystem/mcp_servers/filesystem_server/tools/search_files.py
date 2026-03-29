@@ -4,7 +4,7 @@ from typing import Annotated
 
 from pydantic import Field
 from utils.decorators import make_async_background
-from utils.hsn import annotate_path, hsn_mode_enabled, render_id_map
+from utils.hsn import annotate_path, hsn_mode_enabled
 
 FS_ROOT = os.getenv("APP_FS_ROOT", "/filesystem")
 
@@ -168,15 +168,11 @@ def search_files(
             ids_used.update(ids)
             annotated_lines.append(f"{match_path} {annotation}")
         result += "\n".join(annotated_lines)
-        from utils.hsn import expand_hsn_nodes
-        expanded = expand_hsn_nodes(list(ids_used))
-        if expanded:
-            result += "\n\nExpanded HSN nodes:\n"
-            for child_path, child_ids in expanded:
-                result += f"- {child_path} [HSN: {child_ids}]\n"
-        id_map = render_id_map(ids_used)
-        if id_map:
-            result += f"\n\nHSN id map:\n{id_map}"
+        from utils.hsn import expand_hsn_nodes, render_hsn_tree
+        nodes = expand_hsn_nodes(list(ids_used))
+        if nodes:
+            result += "\n\nHSN tree:\n"
+            result += render_hsn_tree(nodes)
     else:
         result += "\n".join(matches)
 

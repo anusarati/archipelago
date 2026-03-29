@@ -7,9 +7,7 @@ from utils.decorators import make_async_background
 from utils.hsn import (
     FS_HSN_ENABLED,
     annotate_path,
-    hsn_children,
     hsn_mode_enabled,
-    render_id_map,
 )
 
 FS_ROOT = os.getenv("APP_FS_ROOT", "/filesystem")
@@ -25,8 +23,8 @@ _LIST_FILES_DESCRIPTION = (
 )
 if FS_HSN_ENABLED:
     _LIST_FILES_DESCRIPTION += (
-        " In HSN mode, passing a file path returns the file's top-10 HSN children (if "
-        "any) plus an HSN id map."
+        " In HSN mode, passing a file path returns the file's expanded HSN children "
+        "rendered as an indented tree."
     )
 
 
@@ -68,10 +66,9 @@ def list_files(
         if hsn_enabled and os.path.isfile(base):
             file_rel = _to_relative_path(base)
             file_annotation, file_ids = annotate_path(file_rel)
-            ids_used = set(file_ids)
-            from utils.hsn import expand_hsn_nodes
-            children = expand_hsn_nodes([file_ids[-1]])
-            if not children:
+            from utils.hsn import expand_hsn_nodes, render_hsn_tree
+            nodes = expand_hsn_nodes([file_ids[-1]])
+            if not nodes:
                 lines = [
                     f"'{file_rel}' is a file {file_annotation}",
                     "No HSN children found for this file.",
@@ -79,15 +76,10 @@ def list_files(
             else:
                 lines = [
                     f"'{file_rel}' is a file {file_annotation}",
-                    f"Top {len(children)} HSN children:",
+                    "",
+                    "HSN tree:",
+                    render_hsn_tree(nodes),
                 ]
-                for child_path, child_ids in children:
-                    ids_used.update(child_ids)
-                    lines.append(f"- {child_path} [HSN: {child_ids}]")
-
-            id_map = render_id_map(ids_used)
-            if id_map:
-                lines.extend(["", "HSN id map:", id_map])
             return "\n".join(lines)
         return f"[not a directory: {path}]\n"
 
@@ -132,14 +124,10 @@ def list_files(
             items = f"No items found in '{path}'"
 
     if items and hsn_enabled and ids_used:
-        from utils.hsn import expand_hsn_nodes
-        expanded = expand_hsn_nodes(list(ids_used))
-        if expanded:
-            items += "\nExpanded HSN nodes:\n"
-            for child_path, child_ids in expanded:
-                items += f"- {child_path} [HSN: {child_ids}]\n"
-        id_map = render_id_map(ids_used)
-        if id_map:
-            items += f"\nHSN id map:\n{id_map}\n"
+        from utils.hsn import expand_hsn_nodes, render_hsn_tree
+        nodes = expand_hsn_nodes(list(ids_used))
+        if nodes:
+            items += "\nHSN tree:\n"
+            items += render_hsn_tree(nodes) + "\n"
 
     return items

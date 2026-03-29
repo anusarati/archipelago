@@ -247,7 +247,8 @@ def _expand_hsn_nodes_impl(
         if pid is not None and pid in listed_children_count:
             listed_children_count[pid] += 1
 
-    output: list[dict] = []
+    # Build output dicts keyed by node_id
+    node_dicts: dict[int, dict] = {}
     for node_id in visible_nodes:
         node_str = str(node_id)
         child_path = id_to_path.get(node_str, f"<missing:{node_id}>")
@@ -255,14 +256,33 @@ def _expand_hsn_nodes_impl(
         total_children = len(children_map.get(node_str, []))
         listed = listed_children_count.get(node_id, 0)
 
-        output.append({
+        node_dicts[node_id] = {
             "node_id": node_id,
             "path": _normalize_path(child_path),
             "parent_id": parent_in_tree.get(node_id),
             "depth": depth_map.get(node_str, 0),
             "listed_children": listed,
             "total_children": total_children,
-        })
+        }
+
+    # Build children lookup for DFS ordering
+    visible_children: dict[int, list[int]] = {}
+    for nid in visible_nodes:
+        pid = parent_in_tree.get(nid)
+        if pid is not None:
+            visible_children.setdefault(pid, []).append(nid)
+
+    # DFS to produce tree-ordered output
+    output: list[dict] = []
+    roots = [nid for nid in visible_nodes if parent_in_tree.get(nid) is None]
+
+    def dfs(nid: int) -> None:
+        output.append(node_dicts[nid])
+        for child in visible_children.get(nid, []):
+            dfs(child)
+
+    for root in roots:
+        dfs(root)
 
     return output
 

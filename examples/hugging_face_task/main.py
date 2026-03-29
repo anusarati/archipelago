@@ -334,8 +334,8 @@ def main():
                 log(f"Previous world run stop reason: {old_stop_reason}")
 
         if reuse_world_environment:
-            log("Ensuring shared environment for world run...")
-            ensure_environment_ready()
+            log("Starting fresh shared environment for world run...")
+            start_environment()
 
         current_task_id: str | None = None
         task_name_by_id = {

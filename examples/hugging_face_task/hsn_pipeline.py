@@ -915,26 +915,77 @@ def _expand_hsn_nodes_from_data(
         return []
 
     # Map each node to its parent among the start_ids / expanded set
-    parent_in_tree: dict[int, int | None] = {nid: None for nid in start_ids}
-    visible_nodes = list(start_ids)
-    # Track how many times each node has been expanded (0 = never)
-    expanded_counts: dict[str, int] = {str(nid): 0 for nid in start_ids}
-    # Track relative depth from start_ids (all start at 0)
-    depth_map: dict[str, int] = {str(nid): 0 for nid in start_ids}
+    visible_nodes = set()
+    parent_in_tree: dict[int, int | None] = {}
+    depth_map: dict[str, int] = {}
+    distance_map: dict[str, int] = {}
+    up_distance_map: dict[str, int] = {}
+    is_prio: dict[str, bool] = {}
 
-    # Candidates: nodes with children that are not yet fully expanded
+    ancestors_only = set()
+    initial_nodes = set(start_ids)
+    
+    # First, collect all paths for start_ids to add ancestors unconditionally
+    for nid in start_ids:
+        path_raw = paths_map.get(str(nid), [nid])
+        path_ids = []
+        for x in path_raw:
+            try:
+                path_ids.append(int(x))
+            except Exception:
+                pass
+        if not path_ids:
+            path_ids = [nid]
+            
+        for val in path_ids:
+            visible_nodes.add(val)
+            if val not in initial_nodes:
+                ancestors_only.add(val)
+                
+        # Link absolute paths and store distances
+        path_len = len(path_ids)
+        for i, val in enumerate(path_ids):
+            depth_map[str(val)] = i
+            dist = path_len - 1 - i
+            val_str = str(val)
+            if val_str not in distance_map or dist < distance_map[val_str]:
+                distance_map[val_str] = dist
+            if val_str not in up_distance_map or dist < up_distance_map[val_str]:
+                up_distance_map[val_str] = dist
+                
+            if i > 0:
+                parent_in_tree[val] = path_ids[i-1]
+            else:
+                if val not in parent_in_tree:
+                    parent_in_tree[val] = None
+
+    # Priority applies to initial nodes and their descendants. Ancestors are not prio.
+    for val in visible_nodes:
+        val_str = str(val)
+        if val in initial_nodes:
+            is_prio[val_str] = True
+        else:
+            is_prio[val_str] = False
+
+    # Candidates: nodes with children that we can expand
     candidates = set()
-    for node_id in start_ids:
-        key = str(node_id)
-        if children_map.get(key):
-            candidates.add(key)
+    expanded_counts: dict[str, int] = {}
+    for val in visible_nodes:
+        val_str = str(val)
+        expanded_counts[val_str] = 0
+        if children_map.get(val_str):
+            candidates.add(val_str)
+            
+    countable_count = sum(1 for v in visible_nodes if v not in ancestors_only)
 
-    while len(visible_nodes) < limit and candidates:
-        def sort_key(node_id_str: str) -> tuple[int, int, int]:
+    while countable_count < limit and candidates:
+        def sort_key(node_id_str: str) -> tuple[int, int, int, int, int]:
+            is_not_prio = 1 if not is_prio.get(node_id_str, False) else 0
             count = expanded_counts.get(node_id_str, 0)
-            depth = depth_map.get(node_id_str, 0)
+            dist = distance_map.get(node_id_str, 0)
+            up_dist = up_distance_map.get(node_id_str, 0)
             descendants = subtree_size_map.get(node_id_str, 1)
-            return (count, depth, -descendants)
+            return (is_not_prio, count, dist, up_dist, -descendants)
 
         best_node_str = min(candidates, key=sort_key)
 
@@ -949,20 +1000,32 @@ def _expand_hsn_nodes_from_data(
             candidates.discard(best_node_str)
 
         parent_id = int(best_node_str)
+        parent_prio = is_prio.get(best_node_str, False)
         child_depth = depth_map.get(best_node_str, 0) + 1
+        child_dist = distance_map.get(best_node_str, 0) + 1
+        child_up_dist = up_distance_map.get(best_node_str, 0)
+        
         for ans_raw in to_add:
             try:
                 ans = int(ans_raw)
             except Exception:
                 continue
             if ans not in parent_in_tree:
-                visible_nodes.append(ans)
+                visible_nodes.add(ans)
                 parent_in_tree[ans] = parent_id
                 ans_str = str(ans)
                 expanded_counts[ans_str] = 0
                 depth_map[ans_str] = child_depth
+                distance_map[ans_str] = child_dist
+                up_distance_map[ans_str] = child_up_dist
+                is_prio[ans_str] = parent_prio
                 if children_map.get(ans_str):
                     candidates.add(ans_str)
+                
+                if ans not in ancestors_only:
+                    countable_count += 1
+
+    visible_nodes = list(visible_nodes)
 
     # Count how many children of each visible node are also visible
     listed_children_count: dict[int, int] = {nid: 0 for nid in visible_nodes}
@@ -996,9 +1059,13 @@ def _expand_hsn_nodes_from_data(
         if pid is not None:
             visible_children.setdefault(pid, []).append(nid)
 
+    for pid in visible_children:
+        visible_children[pid].sort(key=lambda x: str(id_to_path.get(str(x), str(x))))
+
     # DFS to produce tree-ordered output
     output: list[dict[str, Any]] = []
     roots = [nid for nid in visible_nodes if parent_in_tree.get(nid) is None]
+    roots.sort(key=lambda x: str(id_to_path.get(str(x), str(x))))
 
     def dfs(nid: int) -> None:
         output.append(node_dicts[nid])

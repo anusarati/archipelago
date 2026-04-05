@@ -65,17 +65,17 @@ def list_files(
     if not os.path.isdir(base):
         if hsn_enabled and os.path.isfile(base):
             file_rel = _to_relative_path(base)
-            file_annotation, file_ids = annotate_path(file_rel)
+            _, file_ids = annotate_path(file_rel)
             from utils.hsn import expand_hsn_nodes, render_hsn_tree
-            nodes = expand_hsn_nodes([file_ids[-1]])
+            nodes = expand_hsn_nodes([file_ids[-1]]) if file_ids else []
             if not nodes:
                 lines = [
-                    f"'{file_rel}' is a file {file_annotation}",
+                    f"'{file_rel}' is a file",
                     "No HSN children found for this file.",
                 ]
             else:
                 lines = [
-                    f"'{file_rel}' is a file {file_annotation}",
+                    f"'{file_rel}' is a file",
                     "",
                     "HSN tree:",
                     render_hsn_tree(nodes),
@@ -95,11 +95,12 @@ def list_files(
                     stat_result = entry.stat()
                     if hsn_enabled:
                         entry_rel = _to_relative_path(entry.path)
-                        annotation, ids = annotate_path(entry_rel)
-                        ids_used.update(ids)
+                        _, ids = annotate_path(entry_rel)
+                        if ids:
+                            ids_used.add(ids[-1])
                         items += (
                             f"'{entry.name}' ({mimetype or 'unknown'} file) "
-                            f"{stat_result.st_size} bytes {annotation}\n"
+                            f"{stat_result.st_size} bytes\n"
                         )
                     else:
                         items += (

@@ -164,9 +164,10 @@ def search_files(
         annotated_lines: list[str] = []
         ids_used: set[int] = set()
         for match_path in matches:
-            annotation, ids = annotate_path(match_path)
-            ids_used.update(ids)
-            annotated_lines.append(f"{match_path} {annotation}")
+            _, ids = annotate_path(match_path)
+            if ids:
+                ids_used.add(ids[-1])
+            annotated_lines.append(match_path)
         result += "\n".join(annotated_lines)
         from utils.hsn import expand_hsn_nodes, render_hsn_tree
         nodes = expand_hsn_nodes(list(ids_used))

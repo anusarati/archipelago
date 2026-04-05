@@ -122,6 +122,19 @@ Edit `orchestrator_config.json`:
 }
 ```
 
+To use Google Vertex AI, set the model with a `vertex_ai/` prefix:
+```json
+{
+  "model": "vertex_ai/gemini-3-flash-preview"
+}
+```
+And add your Vertex configurations to `agents/.env`:
+```env
+VERTEX_PROJECT="your-project-id"
+VERTEX_LOCATION="us-central1"
+VERTEX_CREDENTIALS="/path/to/key.json"
+```
+
 ### Using Fewer MCP Servers
 
 By default, this runner loads `mcp_config_all_oss_servers.json` and then filters to the exact servers required by the world's `apps` field from HuggingFace metadata.

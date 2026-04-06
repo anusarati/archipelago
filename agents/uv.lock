@@ -210,7 +210,7 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=2.12.4" },
     { name = "firecrawl-py", specifier = ">=4.12.0" },
     { name = "google-auth", specifier = ">=2.0.0" },
-    { name = "google-cloud-aiplatform", specifier = ">=1.38.0" },
+    { name = "google-cloud-aiplatform", specifier = ">=1.145.0" },
     { name = "hnswlib", specifier = ">=0.8.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "langchain", specifier = ">=1.2.0" },

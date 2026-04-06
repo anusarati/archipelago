@@ -36,7 +36,7 @@ class Settings(BaseSettings):
 
     # Optional token-per-minute guardrails for LLM calls
     # Set LLM_MAX_TOKENS_PER_MINUTE to enable throttling (unset/<=0 disables it)
-    LLM_MAX_TOKENS_PER_MINUTE: int | None = 1_000_000
+    LLM_MAX_TOKENS_PER_MINUTE: int | None = 750_000
     # Reserved output tokens used when max_tokens is not provided in request args
     LLM_TPM_DEFAULT_COMPLETION_TOKENS: int = 2048
     # Conservative multiplier applied to prompt + completion estimate

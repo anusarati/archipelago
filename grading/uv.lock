@@ -854,7 +854,7 @@ requires-dist = [
     { name = "datadog-api-client", specifier = ">=2.44.0" },
     { name = "duckdb", specifier = ">=1.0.0" },
     { name = "firecrawl-py", specifier = ">=1.0.0" },
-    { name = "google-cloud-aiplatform", specifier = ">=1.38.0" },
+    { name = "google-cloud-aiplatform", specifier = ">=1.145.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "icalendar", specifier = ">=6.1.0" },
     { name = "litellm", specifier = ">=1.81.15,<2.0.0" },

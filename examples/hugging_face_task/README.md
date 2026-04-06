@@ -130,9 +130,9 @@ To use Google Vertex AI, set the model with a `vertex_ai/` prefix:
 ```
 And add your Vertex configurations to `agents/.env`:
 ```env
-VERTEX_PROJECT="your-project-id"
-VERTEX_LOCATION="us-central1"
-VERTEX_CREDENTIALS="/path/to/key.json"
+VERTEXAI_PROJECT="your-project-id"
+VERTEXAI_LOCATION="us-central1"
+VERTEXAI_CREDENTIALS="/path/to/key.json"
 ```
 
 ### Using Fewer MCP Servers

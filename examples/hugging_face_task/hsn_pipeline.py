@@ -60,9 +60,6 @@ HSN_PDF_OCR_DPI = int(os.environ.get("HSN_PDF_OCR_DPI", "150"))
 HSN_PDF_OCR_MAX_PAGES = int(os.environ.get("HSN_PDF_OCR_MAX_PAGES", "128"))
 HSN_PDF_OCR_LANG = os.environ.get("HSN_PDF_OCR_LANG", "eng")
 HSN_PDF_OCR_CONFIG = os.environ.get("HSN_PDF_OCR_CONFIG", "--psm 6")
-HSN_PDF_OCR_PAGE_TIMEOUT_SECONDS = int(
-    os.environ.get("HSN_PDF_OCR_PAGE_TIMEOUT_SECONDS", "20")
-)
 HSN_PDF_OCR_THREAD_COUNT = int(os.environ.get("HSN_PDF_OCR_THREAD_COUNT", "2"))
 
 DOCUMENT_EXTENSIONS = {
@@ -221,7 +218,6 @@ def _extract_pdf_text_with_ocr(path: str, data: bytes, log: Callable[[str], None
                 p_image,
                 lang=HSN_PDF_OCR_LANG,
                 config=HSN_PDF_OCR_CONFIG,
-                timeout=max(1, HSN_PDF_OCR_PAGE_TIMEOUT_SECONDS),
             )
             return p_num, p_text
         except Exception as exc:
@@ -738,7 +734,6 @@ def _load_or_collect_documents(
         "pdf_ocr_max_pages": HSN_PDF_OCR_MAX_PAGES,
         "pdf_ocr_lang": HSN_PDF_OCR_LANG,
         "pdf_ocr_config": HSN_PDF_OCR_CONFIG,
-        "pdf_ocr_page_timeout_seconds": HSN_PDF_OCR_PAGE_TIMEOUT_SECONDS,
         "pdf_ocr_thread_count": HSN_PDF_OCR_THREAD_COUNT,
     }
 

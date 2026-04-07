@@ -13,6 +13,7 @@ import gzip
 import warnings
 import zipfile
 import shutil
+import concurrent.futures
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -212,25 +213,32 @@ def _extract_pdf_text_with_ocr(path: str, data: bytes, log: Callable[[str], None
         log(f"  WARNING: PDF OCR failed for {path}: {exc}")
         return ""
 
-    chunks: list[str] = []
-    total_chars = 0
-    for page_num, page_image in enumerate(pages, start=1):
+
+    def _process_page(p_bundle: tuple[int, Any]) -> tuple[int, str]:
+        p_num, p_image = p_bundle
         try:
-            page_text = pytesseract.image_to_string(
-                page_image,
+            p_text = pytesseract.image_to_string(
+                p_image,
                 lang=HSN_PDF_OCR_LANG,
                 config=HSN_PDF_OCR_CONFIG,
                 timeout=max(1, HSN_PDF_OCR_PAGE_TIMEOUT_SECONDS),
             )
+            return p_num, p_text
         except Exception as exc:
-            log(f"  WARNING: PDF OCR page {page_num} failed for {path}: {exc}")
-            continue
+            log(f"  WARNING: PDF OCR page {p_num} failed for {path}: {exc}")
+            return p_num, ""
 
-        if page_text:
-            chunks.append(page_text)
-            total_chars += len(page_text)
-            if total_chars >= HSN_MAX_EXTRACTED_TEXT_CHARS:
-                break
+    chunks: list[str] = []
+    total_chars = 0
+    max_workers = os.cpu_count() or 4
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for p_num, page_text in executor.map(_process_page, enumerate(pages, start=1)):
+            if page_text:
+                chunks.append(page_text)
+                total_chars += len(page_text)
+                if total_chars >= HSN_MAX_EXTRACTED_TEXT_CHARS:
+                    break
 
     text = "\n".join(chunks).strip()
     if not text:

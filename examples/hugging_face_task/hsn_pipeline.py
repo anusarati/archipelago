@@ -180,65 +180,100 @@ def _load_embedding_extra_args() -> dict[str, Any]:
     return payload
 
 
-def _extract_pdf_text_with_ocr(path: str, data: bytes, log: Callable[[str], None]) -> str:
+def _extract_pdf_text_with_fallback(path: str, data: bytes, log: Callable[[str], None]) -> str:
     try:
-        from pdf2image import convert_from_bytes
+        import fitz
+        import pypdf
         import pytesseract
-    except Exception as exc:
+        from PIL import Image
+    except ImportError as exc:
         raise RuntimeError(
-            "HSN PDF OCR requires `pdf2image` and `pytesseract`. Install with `cd agents && uv sync`."
+            "HSN PDF extraction requires `pymupdf`, `pypdf`, `pytesseract`, and `Pillow`. "
+            "Install with `cd agents && uv sync`."
         ) from exc
 
     if shutil.which("tesseract") is None:
-        log(f"  WARNING: PDF OCR skipped for {path}: `tesseract` binary not found")
-        return ""
-    if shutil.which("pdftoppm") is None and shutil.which("pdftocairo") is None:
-        log(
-            f"  WARNING: PDF OCR skipped for {path}: Poppler binary (`pdftoppm`/`pdftocairo`) not found"
-        )
-        return ""
+        log(f"  WARNING: Tesseract not found; PDF OCR fallback will be skipped for {path}")
+
+    fitz_doc = None
+    pdf_reader = None
 
     try:
-        pages = convert_from_bytes(
-            data,
-            dpi=HSN_PDF_OCR_DPI,
-            first_page=1,
-            last_page=max(1, HSN_PDF_OCR_MAX_PAGES),
-            thread_count=max(1, HSN_PDF_OCR_THREAD_COUNT),
-        )
+        fitz_doc = fitz.open(stream=data, filetype="pdf")
     except Exception as exc:
-        log(f"  WARNING: PDF OCR failed for {path}: {exc}")
+        log(f"  WARNING: PyMuPDF open failed for {path}: {exc}")
+
+    try:
+        pdf_reader = pypdf.PdfReader(io.BytesIO(data))
+    except Exception as exc:
+        log(f"  WARNING: pypdf open failed for {path}: {exc}")
+
+    if fitz_doc is None and pdf_reader is None:
+        log(f"  WARNING: Could not open PDF with fitz or pypdf for {path}")
         return ""
 
+    num_pages = len(fitz_doc) if fitz_doc is not None else len(pdf_reader.pages)  # type: ignore
+    num_pages = min(num_pages, max(1, HSN_PDF_OCR_MAX_PAGES))
 
-    def _process_page(p_bundle: tuple[int, Any]) -> tuple[int, str]:
-        p_num, p_image = p_bundle
-        try:
-            p_text = pytesseract.image_to_string(
-                p_image,
-                lang=HSN_PDF_OCR_LANG,
-                config=HSN_PDF_OCR_CONFIG,
-            )
-            return p_num, p_text
-        except Exception as exc:
-            log(f"  WARNING: PDF OCR page {p_num} failed for {path}: {exc}")
-            return p_num, ""
+    def _process_page(p_num: int) -> tuple[int, str]:
+        text = ""
+
+        # 1. Try PyMuPDF (fitz)
+        if fitz_doc is not None:
+            try:
+                page = fitz_doc[p_num]
+                text = page.get_text("text") or ""
+            except Exception:
+                pass
+
+        # 2. Try pypdf fallback
+        if not text.strip() and pdf_reader is not None:
+            try:
+                page = pdf_reader.pages[p_num]
+                text = page.extract_text(extraction_mode="layout") or ""
+            except Exception:
+                pass
+
+        # 3. Try OCR fallback
+        if not text.strip() and fitz_doc is not None and shutil.which("tesseract") is not None:
+            try:
+                page = fitz_doc[p_num]
+                mat = fitz.Matrix(2, 2)
+                pix = page.get_pixmap(matrix=mat)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                ocr_text = pytesseract.image_to_string(
+                    img,
+                    lang=HSN_PDF_OCR_LANG,
+                    config=HSN_PDF_OCR_CONFIG,
+                )
+                if ocr_text:
+                    text = ocr_text
+            except Exception as exc:
+                log(f"  WARNING: PDF OCR page {p_num + 1} failed for {path}: {exc}")
+
+        return p_num, text
 
     chunks: list[str] = []
     total_chars = 0
     max_workers = os.cpu_count() or 4
-    
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for p_num, page_text in executor.map(_process_page, enumerate(pages, start=1)):
+        for p_num, page_text in executor.map(_process_page, range(num_pages)):
             if page_text:
                 chunks.append(page_text)
                 total_chars += len(page_text)
                 if total_chars >= HSN_MAX_EXTRACTED_TEXT_CHARS:
                     break
 
+    if fitz_doc is not None:
+        try:
+            fitz_doc.close()
+        except Exception:
+            pass
+
     text = "\n".join(chunks).strip()
     if not text:
-        log(f"  WARNING: PDF OCR produced empty/whitespace text for {path}")
+        log(f"  WARNING: PDF extraction produced empty/whitespace text for {path}")
     return text[:HSN_MAX_EXTRACTED_TEXT_CHARS]
 
 
@@ -247,7 +282,7 @@ def _extract_text(path: str, data: bytes, converter: Any, log: Callable[[str], N
     if ext in TEXT_EXTENSIONS:
         return data.decode("utf-8", errors="ignore")[:HSN_MAX_EXTRACTED_TEXT_CHARS]
     if ext == "pdf":
-        return _extract_pdf_text_with_ocr(path, data, log)
+        return _extract_pdf_text_with_fallback(path, data, log)
 
     try:
         document = converter.convert(io.BytesIO(data))

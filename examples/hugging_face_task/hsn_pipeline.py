@@ -215,7 +215,10 @@ def _extract_pdf_text_with_fallback(path: str, data: bytes, log: Callable[[str],
     num_pages = len(fitz_doc) if fitz_doc is not None else len(pdf_reader.pages)  # type: ignore
     num_pages = min(num_pages, max(1, HSN_PDF_OCR_MAX_PAGES))
 
-    def _process_page(p_num: int) -> tuple[int, str]:
+    pages_text: list[str | None] = [None] * num_pages
+    pages_needing_ocr: list[int] = []
+
+    for p_num in range(num_pages):
         text = ""
 
         # 1. Try PyMuPDF (fitz)
@@ -233,11 +236,23 @@ def _extract_pdf_text_with_fallback(path: str, data: bytes, log: Callable[[str],
                 text = page.extract_text(extraction_mode="layout") or ""
             except Exception:
                 pass
+                
+        if text.strip():
+            pages_text[p_num] = text
+        else:
+            pages_needing_ocr.append(p_num)
 
-        # 3. Try OCR fallback
-        if not text.strip() and fitz_doc is not None and shutil.which("tesseract") is not None:
-            try:
-                page = fitz_doc[p_num]
+    if fitz_doc is not None:
+        try:
+            fitz_doc.close()
+        except Exception:
+            pass
+
+    def _process_ocr(p_num: int) -> tuple[int, str]:
+        text = ""
+        try:
+            with fitz.open(stream=data, filetype="pdf") as thread_doc:
+                page = thread_doc[p_num]
                 mat = fitz.Matrix(2, 2)
                 pix = page.get_pixmap(matrix=mat)
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -248,28 +263,26 @@ def _extract_pdf_text_with_fallback(path: str, data: bytes, log: Callable[[str],
                 )
                 if ocr_text:
                     text = ocr_text
-            except Exception as exc:
-                log(f"  WARNING: PDF OCR page {p_num + 1} failed for {path}: {exc}")
+        except Exception as exc:
+            log(f"  WARNING: PDF OCR page {p_num + 1} failed for {path}: {exc}")
 
         return p_num, text
 
+    if pages_needing_ocr and shutil.which("tesseract") is not None:
+        max_workers = os.cpu_count() or 4
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for p_num, p_text in executor.map(_process_ocr, pages_needing_ocr):
+                if p_text:
+                    pages_text[p_num] = p_text
+
     chunks: list[str] = []
     total_chars = 0
-    max_workers = os.cpu_count() or 4
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for p_num, page_text in executor.map(_process_page, range(num_pages)):
-            if page_text:
-                chunks.append(page_text)
-                total_chars += len(page_text)
-                if total_chars >= HSN_MAX_EXTRACTED_TEXT_CHARS:
-                    break
-
-    if fitz_doc is not None:
-        try:
-            fitz_doc.close()
-        except Exception:
-            pass
+    for page_text in pages_text:
+        if page_text:
+            chunks.append(page_text)
+            total_chars += len(page_text)
+            if total_chars >= HSN_MAX_EXTRACTED_TEXT_CHARS:
+                break
 
     text = "\n".join(chunks).strip()
     if not text:

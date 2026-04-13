@@ -3,7 +3,7 @@ FROM debian:trixie-slim
 # Install system dependencies
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential ca-certificates chromium coreutils curl fonts-liberation git libreoffice-calc libreoffice-core libsqlite3-dev netcat-openbsd nodejs npm passwd python3.13 python3.13-dev python3.13-venv util-linux \
+ && apt-get install -y --no-install-recommends antiword build-essential ca-certificates chromium coreutils curl fonts-liberation git libreoffice-calc libreoffice-core libsqlite3-dev netcat-openbsd nodejs npm passwd python3.13 python3.13-dev python3.13-venv util-linux \
  && rm -rf /var/lib/apt/lists/* \
  && update-ca-certificates
 

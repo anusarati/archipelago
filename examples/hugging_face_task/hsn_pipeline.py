@@ -325,12 +325,14 @@ def _extract_text(path: str, data: bytes, converter: Any, log: Callable[[str], N
             os.unlink(tf_path)
             if p.returncode == 0 and p.stdout.strip():
                 return p.stdout[:HSN_MAX_EXTRACTED_TEXT_CHARS]
-        except Exception:
+            else:
+                log(f"  WARNING: antiword failed for {path} with returncode {p.returncode}: {p.stderr}")
+        except Exception as e:
+            log(f"  WARNING: antiword exception for {path}: {e}")
             try:
                 os.unlink(tf_path)
             except Exception:
                 pass
-            pass
 
     log(f"  WARNING: Extraction methods failed for {path}; falling back to raw binary string extraction")
     

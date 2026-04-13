@@ -659,6 +659,9 @@ def _extract_embeddings(
         except Exception as exc:
             log(
                 "  WARNING: embedding batch request failed; "
+                + "\n"
+                + str(exc)
+                + "\n"
                 "running binary search to isolate failing input(s)"
             )
             recovered, failures = _bisect_failed_embeddings(

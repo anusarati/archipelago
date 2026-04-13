@@ -307,7 +307,38 @@ def _extract_text(path: str, data: bytes, converter: Any, log: Callable[[str], N
     except Exception:
         pass
 
-    return data.decode("latin-1", errors="ignore")[:HSN_MAX_EXTRACTED_TEXT_CHARS]
+    if ext == "doc" and shutil.which("antiword") is not None:
+        import subprocess
+        import tempfile
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tf:
+                tf.write(data)
+                tf.flush()
+                tf_path = tf.name
+            
+            p = subprocess.run(
+                ["antiword", tf_path],
+                capture_output=True,
+                text=True,
+                errors="ignore"
+            )
+            os.unlink(tf_path)
+            if p.returncode == 0 and p.stdout.strip():
+                return p.stdout[:HSN_MAX_EXTRACTED_TEXT_CHARS]
+        except Exception:
+            try:
+                os.unlink(tf_path)
+            except Exception:
+                pass
+            pass
+
+    log(f"  WARNING: Extraction methods failed for {path}; falling back to raw binary string extraction")
+    
+    raw_text = data.decode("latin-1", errors="ignore")
+    # Replace consecutive unreadable characters (non-printable and non-whitespace) with a single newline
+    cleaned_text = re.sub(r'[^\x20-\x7E\t\r\n]+', '\n', raw_text)
+    
+    return cleaned_text[:HSN_MAX_EXTRACTED_TEXT_CHARS]
 
 
 def _max_non_whitespace_run(text: str) -> int:

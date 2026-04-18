@@ -16,6 +16,11 @@ try:
 except ImportError:  # pragma: no cover
     stats = None
 
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
 
 @dataclass(frozen=True)
 class RunInfo:
@@ -401,6 +406,104 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(",".join(values) + "\n")
 
 
+def _plot_distributions(
+    assistant_metric: MetricResult,
+    score_metric: MetricResult,
+    label_a: str,
+    label_b: str,
+    plot_file: str | None = None,
+    show_plot: bool = False,
+) -> None:
+    if plt is None:
+        print("matplotlib is not installed, skipping plot.", file=sys.stderr)
+        return
+        
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+    def _plot_metric(metric: MetricResult, axes_row: Any) -> None:
+        ax_dist, ax_diff, ax_scatter = axes_row
+        pairs = metric.pairs
+        if not pairs:
+            for ax in axes_row:
+                ax.axis('off')
+            return
+        a_vals = np.array([p[1] for p in pairs], dtype=float)
+        b_vals = np.array([p[2] for p in pairs], dtype=float)
+        diff = b_vals - a_vals
+
+        bins = min(20, max(5, len(pairs) // 5))
+        if np.ptp(a_vals) <= 1e-6 and np.ptp(b_vals) <= 1e-6:
+            bins = 5
+        
+        ax_dist.hist(a_vals, bins=bins, alpha=0.5, label=label_a, density=True)
+        ax_dist.hist(b_vals, bins=bins, alpha=0.5, label=label_b, density=True)
+        
+        if stats is not None:
+            if len(a_vals) > 1 and np.var(a_vals) > 1e-12:
+                try:
+                    kde_a = stats.gaussian_kde(a_vals, bw_method='silverman')
+                    x_a = np.linspace(np.min(a_vals), np.max(a_vals), 100)
+                    ax_dist.plot(x_a, kde_a(x_a), color='blue', alpha=0.7, lw=2)
+                except Exception:
+                    pass
+            if len(b_vals) > 1 and np.var(b_vals) > 1e-12:
+                try:
+                    kde_b = stats.gaussian_kde(b_vals, bw_method='silverman')
+                    x_b = np.linspace(np.min(b_vals), np.max(b_vals), 100)
+                    ax_dist.plot(x_b, kde_b(x_b), color='orange', alpha=0.7, lw=2)
+                except Exception:
+                    pass
+
+        ax_dist.set_title(f"{metric.name}: Distributions")
+        ax_dist.set_xlabel("Value")
+        ax_dist.set_ylabel("Density")
+        ax_dist.legend()
+
+        ax_diff.hist(diff, bins=bins, alpha=0.7, color='green', density=True)
+        ax_diff.axvline(x=0, color='red', linestyle='--', label='No diff')
+        
+        if stats is not None and len(diff) > 1 and np.var(diff) > 1e-12:
+            try:
+                kde_diff = stats.gaussian_kde(diff, bw_method='silverman')
+                x_diff = np.linspace(np.min(diff), np.max(diff), 100)
+                ax_diff.plot(x_diff, kde_diff(x_diff), color='darkgreen', lw=2)
+            except Exception:
+                pass
+
+        ax_diff.set_title(f"{metric.name}: Paired Diff ({label_b} - {label_a})")
+        ax_diff.set_xlabel("Difference")
+        ax_diff.set_ylabel("Density")
+        ax_diff.legend()
+
+        scatter_min = min(np.min(a_vals), np.min(b_vals))
+        scatter_max = max(np.max(a_vals), np.max(b_vals))
+        margin = (scatter_max - scatter_min) * 0.05
+        if margin == 0:
+            margin = 1.0
+
+        ax_scatter.scatter(a_vals, b_vals, alpha=0.6)
+        ax_scatter.plot([scatter_min - margin, scatter_max + margin], 
+                        [scatter_min - margin, scatter_max + margin], 
+                        'r--', label='y = x')
+        ax_scatter.set_title(f"{metric.name}: Scatter")
+        ax_scatter.set_xlabel(label_a)
+        ax_scatter.set_ylabel(label_b)
+        ax_scatter.grid(True, linestyle='--', alpha=0.7)
+        ax_scatter.legend()
+
+    _plot_metric(assistant_metric, axes[0])
+    _plot_metric(score_metric, axes[1])
+    
+    plt.tight_layout()
+    if plot_file:
+        plt.savefig(plot_file, dpi=150)
+        print(f"Saved distribution plots to {plot_file}")
+    if show_plot:
+        plt.show()
+    if not show_plot and not plot_file:
+        plt.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -423,6 +526,8 @@ def main() -> int:
     )
     parser.add_argument("--json", dest="json_path", help="Write JSON summary file.")
     parser.add_argument("--csv", dest="csv_path", help="Write CSV of per-task pairs.")
+    parser.add_argument("--plot", action="store_true", help="Plot the distributions interactively.")
+    parser.add_argument("--plot-file", help="Save the distributions plot to a file.")
     args = parser.parse_args()
 
     run_a_path = Path(args.run_a)
@@ -513,6 +618,16 @@ def main() -> int:
                 }
             )
         _write_csv(Path(args.csv_path), rows)
+
+    if args.plot or args.plot_file:
+        _plot_distributions(
+            assistant_metric,
+            score_metric,
+            run_a.label,
+            run_b.label,
+            plot_file=args.plot_file,
+            show_plot=args.plot,
+        )
 
     return 0
 

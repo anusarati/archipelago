@@ -132,8 +132,11 @@ def _collect_metrics(
     run_a: RunInfo,
     run_b: RunInfo,
     assistant_mode: str,
-) -> tuple[MetricResult, MetricResult]:
+    max_min_assistant: int | None = None,
+    min_max_assistant: int | None = None,
+) -> tuple[MetricResult, MetricResult, list[str]]:
     common_task_ids = sorted(set(run_a.tasks) & set(run_b.tasks))
+    valid_task_ids: list[str] = []
     assistant_pairs: list[tuple[str, float, float]] = []
     assistant_missing_a: list[str] = []
     assistant_missing_b: list[str] = []
@@ -147,6 +150,20 @@ def _collect_metrics(
 
         assistant_a = _assistant_message_count(task_a, assistant_mode)
         assistant_b = _assistant_message_count(task_b, assistant_mode)
+
+        if max_min_assistant is not None:
+            if assistant_a is None or assistant_b is None:
+                continue
+            if min(assistant_a, assistant_b) > max_min_assistant:
+                continue
+                
+        if min_max_assistant is not None:
+            if assistant_a is None or assistant_b is None:
+                continue
+            if max(assistant_a, assistant_b) < min_max_assistant:
+                continue
+                
+        valid_task_ids.append(task_id)
         if assistant_a is None:
             assistant_missing_a.append(task_id)
         if assistant_b is None:
@@ -176,6 +193,7 @@ def _collect_metrics(
             missing_a=score_missing_a,
             missing_b=score_missing_b,
         ),
+        valid_task_ids,
     )
 
 
@@ -406,6 +424,71 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(",".join(values) + "\n")
 
 
+def _sweep_filters(run_a: RunInfo, run_b: RunInfo, assistant_mode: str, alpha: float) -> None:
+    common_task_ids = sorted(set(run_a.tasks) & set(run_b.tasks))
+    task_data = []
+
+    for task_id in common_task_ids:
+        task_a = run_a.tasks[task_id]
+        task_b = run_b.tasks[task_id]
+        ast_a = _assistant_message_count(task_a, assistant_mode)
+        ast_b = _assistant_message_count(task_b, assistant_mode)
+        score_a = _final_score(task_id, task_a, run_a.summary_scores)
+        score_b = _final_score(task_id, task_b, run_b.summary_scores)
+        
+        if ast_a is not None and ast_b is not None:
+            task_data.append({
+                "task_id": task_id,
+                "ast_a": float(ast_a),
+                "ast_b": float(ast_b),
+                "score_a": None if score_a is None else float(score_a),
+                "score_b": None if score_b is None else float(score_b),
+            })
+            
+    if not task_data:
+        print("No paired tasks with valid assistant messages found for sweeping.")
+        return
+
+    mins = sorted(set(min(d["ast_a"], d["ast_b"]) for d in task_data))
+    maxs = sorted(set(max(d["ast_a"], d["ast_b"]) for d in task_data))
+
+    def _eval_threshold(condition_func: Any, filter_name: str, thresholds: list[float], metric_key_a: str, metric_key_b: str, metric_name: str) -> None:
+        results = []
+        for th in thresholds:
+            filtered = [d for d in task_data if condition_func(d, th)]
+            a_vals_list = [d[metric_key_a] for d in filtered if d[metric_key_a] is not None and d[metric_key_b] is not None]
+            b_vals_list = [d[metric_key_b] for d in filtered if d[metric_key_a] is not None and d[metric_key_b] is not None]
+            
+            if len(a_vals_list) < 3:
+                continue
+                
+            a_arr = np.array(a_vals_list, dtype=float)
+            b_arr = np.array(b_vals_list, dtype=float)
+            diff = b_arr - a_arr
+            
+            test_res = _paired_test(a_arr, b_arr, diff, alpha)
+            p_val = test_res.get("p_value")
+            
+            if p_val is not None:
+                results.append((th, p_val, len(a_arr)))
+                
+        results.sort(key=lambda x: x[1])
+        
+        print(f"\nTop 5 {filter_name} thresholds for lowest {metric_name} p-value:")
+        print(f"{'Threshold':>12} | {'p-value':>10} | {'N':>4}")
+        print("-" * 33)
+        for th, p_val, n in results[:5]:
+            print(f"{th:>12g} | {p_val:>10.4g} | {n:>4}")
+
+    print("\n--- Sweeping Thresholds ---")
+    _eval_threshold(lambda d, th: min(d["ast_a"], d["ast_b"]) <= th, "max-min-ast", mins, "ast_a", "ast_b", "assistant_messages")
+    _eval_threshold(lambda d, th: max(d["ast_a"], d["ast_b"]) >= th, "min-max-ast", maxs, "ast_a", "ast_b", "assistant_messages")
+    
+    _eval_threshold(lambda d, th: min(d["ast_a"], d["ast_b"]) <= th, "max-min-ast", mins, "score_a", "score_b", "final_score")
+    _eval_threshold(lambda d, th: max(d["ast_a"], d["ast_b"]) >= th, "min-max-ast", maxs, "score_a", "score_b", "final_score")
+    print("---------------------------\n")
+
+
 def _plot_distributions(
     assistant_metric: MetricResult,
     score_metric: MetricResult,
@@ -528,6 +611,9 @@ def main() -> int:
     parser.add_argument("--csv", dest="csv_path", help="Write CSV of per-task pairs.")
     parser.add_argument("--plot", action="store_true", help="Plot the distributions interactively.")
     parser.add_argument("--plot-file", help="Save the distributions plot to a file.")
+    parser.add_argument("--max-min-assistant-messages", type=int, help="Compare only tasks where min(A, B) assistant counts <= value.")
+    parser.add_argument("--min-max-assistant-messages", type=int, help="Compare only tasks where max(A, B) assistant counts >= value.")
+    parser.add_argument("--sweep-filters", action="store_true", help="Sweep possible thresholds and output the ones yielding the lowest p-values.")
     args = parser.parse_args()
 
     run_a_path = Path(args.run_a)
@@ -549,16 +635,18 @@ def main() -> int:
         summary_scores=_load_summary_scores(run_b_path),
     )
 
-    assistant_metric, score_metric = _collect_metrics(
-        run_a, run_b, args.assistant_mode
+    assistant_metric, score_metric, common_tasks = _collect_metrics(
+        run_a, run_b, args.assistant_mode, args.max_min_assistant_messages, args.min_max_assistant_messages
     )
-
-    common_tasks = sorted(set(run_a.tasks) & set(run_b.tasks))
     print(f"Run A: {run_a.label} ({run_a.path})")
     print(f"Run B: {run_b.label} ({run_b.path})")
     print(f"Tasks in A: {len(run_a.tasks)}")
     print(f"Tasks in B: {len(run_b.tasks)}")
     print(f"Paired tasks: {len(common_tasks)}")
+    
+    if args.sweep_filters:
+        _sweep_filters(run_a, run_b, args.assistant_mode, args.alpha)
+
     if args.assistant_mode == "content":
         print("Assistant message count: content-only messages")
     else:

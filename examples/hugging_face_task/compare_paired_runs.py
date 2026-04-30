@@ -209,9 +209,11 @@ def _format_float(value: float | None) -> str:
 
 def _summary_stats(values: np.ndarray) -> dict[str, Any]:
     skewness = None
+    kurtosis = None
     if stats is not None and values.size > 2:
         try:
             skewness = float(stats.skew(values))
+            kurtosis = float(stats.kurtosis(values))
         except Exception:
             pass
     return {
@@ -223,10 +225,11 @@ def _summary_stats(values: np.ndarray) -> dict[str, Any]:
         "max": float(np.max(values)),
         "iqr": float(np.percentile(values, 75) - np.percentile(values, 25)),
         "skewness": skewness,
+        "kurtosis": kurtosis,
     }
 
 
-def _paired_test(a_vals: np.ndarray, b_vals: np.ndarray, diff: np.ndarray, alpha: float) -> dict[str, Any]:
+def _paired_test(a_vals: np.ndarray, b_vals: np.ndarray, diff: np.ndarray, alpha: float, run_permutation: bool = False) -> dict[str, Any]:
     if stats is None:
         return {"test": "unavailable", "reason": "scipy_not_installed"}
     if diff.size < 3:
@@ -236,50 +239,61 @@ def _paired_test(a_vals: np.ndarray, b_vals: np.ndarray, diff: np.ndarray, alpha
 
     normality_p = None
     use_ttest = False
+    cochran_valid = False
+
+    try:
+        diff_skewness = float(stats.skew(diff))
+        if diff.size > 25 * (diff_skewness ** 2):
+            cochran_valid = True
+            use_ttest = True
+    except Exception:
+        pass
+
     if 3 <= diff.size <= 5000:
         try:
             normality_p = float(stats.shapiro(diff).pvalue)
-            use_ttest = normality_p >= alpha
+            if normality_p >= alpha:
+                use_ttest = True
         except Exception:
-            use_ttest = False
+            pass
 
-    ret: dict[str, Any] = {}
-    if use_ttest:
-        result = stats.ttest_rel(diff, np.zeros_like(diff))
-        t_stat = float(result.statistic)
+    ret: dict[str, Any] = {"normality_p": normality_p, "cochran_valid": cochran_valid}
+
+    try:
+        result = stats.wilcoxon(diff, zero_method="pratt", alternative="two-sided")
+        w_stat = float(result.statistic)
         p_value = float(result.pvalue)
-        sd = float(np.std(diff, ddof=1))
-        cohen_d = float(np.mean(diff) / sd) if sd else None
-        ret = {
-            "test": "paired_t",
-            "statistic": t_stat,
+        if p_value > 0:
+            z_score = float(stats.norm.isf(p_value / 2))
+            r = z_score / math.sqrt(diff.size)
+            if float(np.median(diff)) < 0:
+                r = -r
+        else:
+            r = None
+        ret["wilcoxon"] = {
+            "statistic": w_stat,
             "p_value": p_value,
-            "effect_size": cohen_d,
-            "effect_size_label": "cohen_d",
-            "normality_p": normality_p,
+            "effect_size": r,
+            "effect_size_label": "r",
         }
-    else:
+    except Exception as exc:
+        ret["wilcoxon_error"] = str(exc)
+
+    if use_ttest:
         try:
-            result = stats.wilcoxon(diff, zero_method="pratt", alternative="two-sided")
-            w_stat = float(result.statistic)
+            result = stats.ttest_rel(diff, np.zeros_like(diff))
+            t_stat = float(result.statistic)
             p_value = float(result.pvalue)
-            if p_value > 0:
-                z_score = float(stats.norm.isf(p_value / 2))
-                r = z_score / math.sqrt(diff.size)
-                if float(np.median(diff)) < 0:
-                    r = -r
-            else:
-                r = None
-            ret = {
-                "test": "wilcoxon_signed_rank",
-                "statistic": w_stat,
+            sd = float(np.std(diff, ddof=1))
+            cohen_d = float(np.mean(diff) / sd) if sd else None
+            ret["t_test"] = {
+                "statistic": t_stat,
                 "p_value": p_value,
-                "effect_size": r,
-                "effect_size_label": "r",
-                "normality_p": normality_p,
+                "effect_size": cohen_d,
+                "effect_size_label": "cohen_d",
             }
         except Exception as exc:
-            ret = {"test": "unavailable", "reason": f"wilcoxon_error:{exc}", "normality_p": normality_p}
+            ret["t_test_error"] = str(exc)
 
     pos = int(np.sum(diff > 0))
     neg = int(np.sum(diff < 0))
@@ -307,6 +321,22 @@ def _paired_test(a_vals: np.ndarray, b_vals: np.ndarray, diff: np.ndarray, alpha
     except Exception:
         pass
 
+    if run_permutation and diff.size > 0:
+        try:
+            def statistic(x, y, axis):
+                return np.mean(x - y, axis=axis)
+            
+            res = stats.permutation_test(
+                (b_vals, a_vals),
+                statistic,
+                permutation_type='samples',
+                n_resamples=10000,
+                alternative='two-sided'
+            )
+            ret["permutation_p"] = float(res.pvalue)
+        except Exception as exc:
+            ret["permutation_error"] = str(exc)
+
     return ret
 
 
@@ -330,7 +360,7 @@ def _render_metric(
     stats_a = _summary_stats(a_vals)
     stats_b = _summary_stats(b_vals)
     stats_diff = _summary_stats(diff)
-    test_result = _paired_test(a_vals, b_vals, diff, alpha)
+    test_result = _paired_test(a_vals, b_vals, diff, alpha, run_permutation=True)
 
     lines = [
         f"{metric.name}: paired samples = {stats_diff['n']}",
@@ -339,38 +369,41 @@ def _render_metric(
         f"std={_format_float(stats_a['std'])} "
         f"min={_format_float(stats_a['min'])} "
         f"max={_format_float(stats_a['max'])} "
-        f"skewness={_format_float(stats_a.get('skewness'))}",
+        f"skewness={_format_float(stats_a.get('skewness'))} "
+        f"kurtosis={_format_float(stats_a.get('kurtosis'))}",
         f"{label_b}: mean={_format_float(stats_b['mean'])} "
         f"median={_format_float(stats_b['median'])} "
         f"std={_format_float(stats_b['std'])} "
         f"min={_format_float(stats_b['min'])} "
         f"max={_format_float(stats_b['max'])} "
-        f"skewness={_format_float(stats_b.get('skewness'))}",
+        f"skewness={_format_float(stats_b.get('skewness'))} "
+        f"kurtosis={_format_float(stats_b.get('kurtosis'))}",
         f"diff (B-A): mean={_format_float(stats_diff['mean'])} "
         f"median={_format_float(stats_diff['median'])} "
         f"std={_format_float(stats_diff['std'])} "
         f"min={_format_float(stats_diff['min'])} "
         f"max={_format_float(stats_diff['max'])} "
-        f"skewness={_format_float(stats_diff.get('skewness'))}",
+        f"skewness={_format_float(stats_diff.get('skewness'))} "
+        f"kurtosis={_format_float(stats_diff.get('kurtosis'))}",
     ]
 
-    if test_result.get("test") == "paired_t":
+    if "t_test" in test_result:
         lines.append(
             "test: paired t-test (two-sided), "
-            f"t={_format_float(test_result.get('statistic'))}, "
-            f"p={_format_float(test_result.get('p_value'))}, "
-            f"d={_format_float(test_result.get('effect_size'))}"
+            f"t={_format_float(test_result['t_test'].get('statistic'))}, "
+            f"p={_format_float(test_result['t_test'].get('p_value'))}, "
+            f"d={_format_float(test_result['t_test'].get('effect_size'))}"
         )
-    elif test_result.get("test") == "wilcoxon_signed_rank":
+    if "wilcoxon" in test_result:
         lines.append(
             "test: Wilcoxon signed-rank (two-sided), "
-            f"W={_format_float(test_result.get('statistic'))}, "
-            f"p={_format_float(test_result.get('p_value'))}, "
-            f"r={_format_float(test_result.get('effect_size'))}"
+            f"W={_format_float(test_result['wilcoxon'].get('statistic'))}, "
+            f"p={_format_float(test_result['wilcoxon'].get('p_value'))}, "
+            f"r={_format_float(test_result['wilcoxon'].get('effect_size'))}"
         )
-    else:
+    if "t_test" not in test_result and "wilcoxon" not in test_result:
         lines.append(
-            f"test: unavailable ({test_result.get('reason','unknown')})"
+            f"test: unavailable ({test_result.get('reason', test_result.get('wilcoxon_error', 'unknown'))})"
         )
 
     if test_result.get("sign_p") is not None:
@@ -390,10 +423,16 @@ def _render_metric(
             f"p={_format_float(test_result.get('ad_p'))}"
         )
 
+    if test_result.get("permutation_p") is not None:
+        lines.append(f"test: Monte Carlo Permutation (10k), p={_format_float(test_result.get('permutation_p'))}")
+
     if test_result.get("normality_p") is not None:
         lines.append(
             f"normality (Shapiro) p={_format_float(test_result.get('normality_p'))}"
         )
+
+    if test_result.get("cochran_valid") is not None:
+        lines.append(f"Cochran's rule valid: {test_result.get('cochran_valid')}")
 
     summary = {
         "metric": metric.name,
@@ -518,44 +557,47 @@ def _plot_distributions(
         if np.ptp(a_vals) <= 1e-6 and np.ptp(b_vals) <= 1e-6:
             bins = 5
         
-        ax_dist.hist(a_vals, bins=bins, alpha=0.5, label=label_a, density=True)
-        ax_dist.hist(b_vals, bins=bins, alpha=0.5, label=label_b, density=True)
+        _, bins_a, _ = ax_dist.hist(a_vals, bins=bins, alpha=0.5, label=label_a)
+        _, bins_b, _ = ax_dist.hist(b_vals, bins=bins, alpha=0.5, label=label_b)
         
         if stats is not None:
             if len(a_vals) > 1 and np.var(a_vals) > 1e-12:
                 try:
                     kde_a = stats.gaussian_kde(a_vals, bw_method='silverman')
                     x_a = np.linspace(np.min(a_vals), np.max(a_vals), 100)
-                    ax_dist.plot(x_a, kde_a(x_a), color='blue', alpha=0.7, lw=2)
+                    scale_a = len(a_vals) * (bins_a[1] - bins_a[0])
+                    ax_dist.plot(x_a, kde_a(x_a) * scale_a, color='blue', alpha=0.7, lw=2)
                 except Exception:
                     pass
             if len(b_vals) > 1 and np.var(b_vals) > 1e-12:
                 try:
                     kde_b = stats.gaussian_kde(b_vals, bw_method='silverman')
                     x_b = np.linspace(np.min(b_vals), np.max(b_vals), 100)
-                    ax_dist.plot(x_b, kde_b(x_b), color='orange', alpha=0.7, lw=2)
+                    scale_b = len(b_vals) * (bins_b[1] - bins_b[0])
+                    ax_dist.plot(x_b, kde_b(x_b) * scale_b, color='orange', alpha=0.7, lw=2)
                 except Exception:
                     pass
 
         ax_dist.set_title(f"{metric.name}: Distributions")
         ax_dist.set_xlabel("Value")
-        ax_dist.set_ylabel("Density")
+        ax_dist.set_ylabel("Count")
         ax_dist.legend()
 
-        ax_diff.hist(diff, bins=bins, alpha=0.7, color='green', density=True)
+        _, bins_diff, _ = ax_diff.hist(diff, bins=bins, alpha=0.7, color='green')
         ax_diff.axvline(x=0, color='red', linestyle='--', label='No diff')
         
         if stats is not None and len(diff) > 1 and np.var(diff) > 1e-12:
             try:
                 kde_diff = stats.gaussian_kde(diff, bw_method='silverman')
                 x_diff = np.linspace(np.min(diff), np.max(diff), 100)
-                ax_diff.plot(x_diff, kde_diff(x_diff), color='darkgreen', lw=2)
+                scale_diff = len(diff) * (bins_diff[1] - bins_diff[0])
+                ax_diff.plot(x_diff, kde_diff(x_diff) * scale_diff, color='darkgreen', lw=2)
             except Exception:
                 pass
 
         ax_diff.set_title(f"{metric.name}: Paired Diff ({label_b} - {label_a})")
         ax_diff.set_xlabel("Difference")
-        ax_diff.set_ylabel("Density")
+        ax_diff.set_ylabel("Count")
         ax_diff.legend()
 
         scatter_min = min(np.min(a_vals), np.min(b_vals))

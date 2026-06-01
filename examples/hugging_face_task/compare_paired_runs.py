@@ -337,6 +337,21 @@ def _paired_test(a_vals: np.ndarray, b_vals: np.ndarray, diff: np.ndarray, alpha
         except Exception as exc:
             ret["permutation_error"] = str(exc)
 
+        try:
+            def statistic_median(x, y, axis):
+                return np.median(x - y, axis=axis)
+            
+            res_median = stats.permutation_test(
+                (b_vals, a_vals),
+                statistic_median,
+                permutation_type='samples',
+                n_resamples=10000,
+                alternative='two-sided'
+            )
+            ret["permutation_median_p"] = float(res_median.pvalue)
+        except Exception as exc:
+            ret["permutation_median_error"] = str(exc)
+
     return ret
 
 
@@ -424,7 +439,10 @@ def _render_metric(
         )
 
     if test_result.get("permutation_p") is not None:
-        lines.append(f"test: Monte Carlo Permutation (10k), p={_format_float(test_result.get('permutation_p'))}")
+        lines.append(f"test: Monte Carlo Permutation (10k) Mean, p={_format_float(test_result.get('permutation_p'))}")
+
+    if test_result.get("permutation_median_p") is not None:
+        lines.append(f"test: Monte Carlo Permutation (10k) Median, p={_format_float(test_result.get('permutation_median_p'))}")
 
     if test_result.get("normality_p") is not None:
         lines.append(
@@ -506,7 +524,11 @@ def _sweep_filters(run_a: RunInfo, run_b: RunInfo, assistant_mode: str, alpha: f
             diff = b_arr - a_arr
             
             test_res = _paired_test(a_arr, b_arr, diff, alpha)
-            p_val = test_res.get("p_value")
+            p_val = None
+            if "t_test" in test_res:
+                p_val = test_res["t_test"].get("p_value")
+            elif "wilcoxon" in test_res:
+                p_val = test_res["wilcoxon"].get("p_value")
             
             if p_val is not None:
                 results.append((th, p_val, len(a_arr)))
